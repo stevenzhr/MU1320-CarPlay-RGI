@@ -1,0 +1,170 @@
+#!/bin/sh
+set -eu
+for var in LD_PRELOAD LD_DEBUG DL_DEBUG LD_DEBUG_OUTPUT; do unset "$var" || :; done
+PATH=/proc/boot:/bin:/usr/bin:/sbin:/usr/sbin:/mnt/app/armle/bin:/mnt/app/armle/usr/bin
+export PATH
+[ "$#" -ge 1 ] || exit 2
+action=$1; phase=${2:-snapshot}
+case "$action:$#" in status:1|install:1|arm:1|disarm:1|rollback:1|collect:2) ;; *) exit 2 ;; esac
+case "$phase" in armed|restored|snapshot) ;; *) exit 2 ;; esac
+case "$0" in */*) stage_dir=${0%/*} ;; *) exit 2 ;; esac
+stage_dir=$(CDPATH= cd "$stage_dir" && pwd -P)
+ROOT=/mnt/app/root/mu1320-rgi-navhook-v1
+SYSTEM=/mnt/system/etc/eso/production/smartphone_integrator.json
+ACTIVE=/etc/eso/production/smartphone_integrator.json
+ARM=/tmp/mu1320-navhook-v1.arm
+VERBOSE=/tmp/carplay_verbose
+MARKER=mu1320_navhook_v1_5c45c31e
+fail() { echo "STOP: $*" >&2; exit 1; }
+exists() { [ -e "$1" ] || [ -L "$1" ]; }
+for utility in id uname cksum ls cat; do command -v "$utility" >/dev/null 2>&1 || fail "missing $utility"; done
+uid=$(id -u); set -f; set -- $uid
+[ "$#" = 1 ] && [ "$1" = 0 ] || fail 'effective UID must be 0'
+case "$(uname -a)" in QNX\ *\ 6.5.0\ *\ armle) ;; *) fail 'wrong platform' ;; esac
+check() { [ -f "$3" ] && [ ! -L "$3" ] || return 1; c=$1; n=$2; output=$(cksum "$3") || return 1; set -- $output; [ "${1:-}" = "$c" ] && [ "${2:-}" = "$n" ]; }
+attrs() { output=$(LC_ALL=C ls -ln "$1") || return 1; set -- $output; [ "$#" -ge 5 ] || return 1; printf '%s %s %s\n' "$1" "$3" "$4"; }
+dir_attrs() { output=$(LC_ALL=C ls -ldn "$1") || return 1; set -- $output; [ "$#" -ge 5 ] || return 1; printf '%s %s %s\n' "$1" "$3" "$4"; }
+old_ok() { check @SI_OLD_CRC@ @SI_OLD_SIZE@ "$1" && [ "$(attrs "$1")" = '-rw-r--r-- 0 0' ]; }
+new_ok() { check @SI_NEW_CRC@ @SI_NEW_SIZE@ "$1" && [ "$(attrs "$1")" = '-rw-r--r-- 0 0' ]; }
+run_clean() { (for var in LD_PRELOAD LD_DEBUG DL_DEBUG LD_DEBUG_OUTPUT; do unset "$var" || :; done; LD_LIBRARY_PATH=/proc/boot:/lib exec "$@"); }
+check @MOUNT_CRC@ @MOUNT_SIZE@ "$stage_dir/mount_state" || fail 'mount helper checksum'
+check @COLLECT_CRC@ @COLLECT_SIZE@ "$stage_dir/collect_navhook.sh" || fail 'collector checksum'
+check 3727885851 560715 /proc/boot/libc.so.3 || fail 'libc baseline'
+state() { run_clean "$stage_dir/mount_state" "$1"; }
+app_state=$(state /mnt/app) || fail 'app mount query'; system_state=$(state /mnt/system) || fail 'system mount query'
+case "$app_state:$system_state" in ro:ro|ro:rw|rw:ro|rw:rw) ;; *) fail 'unknown mount states' ;; esac
+config_state() { if old_ok "$1"; then echo BASELINE; elif new_ok "$1"; then echo NAVHOOK_TRIAL; else echo UNKNOWN; fi; }
+echo "SYSTEM_CONFIG: $(config_state "$SYSTEM")"; echo "ACTIVE_CONFIG: $(config_state "$ACTIVE")"
+echo "MOUNTS: app=$app_state system=$system_state"; echo "EXPECTED_MARKER: MU1320_NAVHOOK_TRIAL=$MARKER"
+runtime_ok() {
+    [ -d "$ROOT" ] && [ ! -L "$ROOT" ] && [ -d "$ROOT/config" ] || fail 'unsafe runtime workspace'
+    [ "$(dir_attrs "$ROOT")" = 'drwx------ 0 0' ] || fail 'runtime root attributes'
+    [ "$(dir_attrs "$ROOT/config")" = 'drwx------ 0 0' ] || fail 'runtime config directory attributes'
+    check @IDENTITY_CRC@ @IDENTITY_SIZE@ "$ROOT/IDENTITY" || fail 'identity mismatch'
+    check @HOOK_CRC@ @HOOK_SIZE@ "$ROOT/libcarplay_hook.so" || fail 'runtime hook checksum'
+    [ "$(attrs "$ROOT/libcarplay_hook.so")" = '-rw-r--r-- 0 0' ] || fail 'runtime hook attributes'
+    check @DIO_NEW_CRC@ @DIO_NEW_SIZE@ "$ROOT/config/dio_manager.json" || fail 'runtime dio config checksum'
+    [ "$(attrs "$ROOT/config/dio_manager.json")" = '-rw-r--r-- 0 0' ] || fail 'runtime dio config attributes'
+    @NATIVE_CHECKS@
+}
+token_status() { if exists "$ARM"; then if check @ARM_CRC@ @ARM_SIZE@ "$ARM" && [ "$(attrs "$ARM")" = '-rw------- 0 0' ]; then echo OWN_ARMED; else echo UNKNOWN_PRESENT; fi; else echo ABSENT; fi; }
+echo "TOKEN: $(token_status)"
+if [ "$action" = status ]; then echo 'FILE_STATE_ONLY: process activation requires live evidence'; exit 0; fi
+if [ "$action" = collect ]; then exec /bin/sh "$stage_dir/collect_navhook.sh" "$phase"; fi
+disarm() {
+    if exists "$ARM"; then
+        check @ARM_CRC@ @ARM_SIZE@ "$ARM" && [ "$(attrs "$ARM")" = '-rw------- 0 0' ] || fail 'unknown arm token; preserve it'
+        target="/tmp/mu1320-navhook-v1.disarmed.$$"
+        if exists "$target"; then fail 'disarm destination collision'; fi
+        mv "$ARM" "$target"
+    fi
+}
+if [ "$action" = disarm ]; then
+    command -v mv >/dev/null 2>&1 || fail 'missing mv'; disarm
+    echo 'DISARMED: a currently active DIO remains active until it exits; disconnect USB and rollback'; exit 0
+fi
+if [ "$action" = arm ]; then
+    for utility in pidin mv chmod rm; do command -v "$utility" >/dev/null 2>&1 || fail "missing $utility"; done
+    new_ok "$SYSTEM" && new_ok "$ACTIVE" || fail 'trial SI must be visible at BOTH paths after a normal full restart'
+    runtime_ok
+    table=$(pidin -F '%256n') || fail 'cannot inspect live processes'
+    while IFS= read -r name rest; do case "$name" in */dio_manager|dio_manager) fail 'dio_manager already exists; disconnect USB and wait before arm' ;; esac; done <<EOF
+$table
+EOF
+    if exists "$ARM"; then fail 'arm token already exists'; fi
+    if exists "$VERBOSE"; then fail 'pre-existing verbose marker; preserve it and reboot before this trial'; fi
+    tmp="/tmp/mu1320-navhook-v1.arm.pending.$$"
+    if exists "$tmp"; then fail 'arm temporary collision'; fi
+    umask 077; (set -C; printf 'MU1320-NAVHOOK-ONE-SHOT-V1\n' > "$tmp") || fail 'arm token create'
+    chmod 600 "$tmp"; check @ARM_CRC@ @ARM_SIZE@ "$tmp" || fail 'arm token validation'
+    [ "$(attrs "$tmp")" = '-rw------- 0 0' ] || fail 'arm token attributes'
+    if ! (set -C; printf 'MU1320-NAVHOOK-V1-VERBOSE\n' > "$VERBOSE"); then
+        rm "$tmp" || :; fail 'verbose marker create'
+    fi
+    chmod 600 "$VERBOSE"
+    if ! mv "$tmp" "$ARM"; then
+        rm "$VERBOSE" || :; fail 'arm token publish'
+    fi
+    echo 'ARMED_ONCE: connect USB once; the first DIO consumes the token, replacements stay passive'; exit 0
+fi
+for utility in cp mv chmod mkdir sync mount; do command -v "$utility" >/dev/null 2>&1 || fail "missing $utility"; done
+for directory in /mnt/app/root /mnt/system/etc /mnt/system/etc/eso /mnt/system/etc/eso/production; do [ -d "$directory" ] && [ ! -L "$directory" ] || fail "unsafe directory $directory"; done
+resume_workspace=0
+if [ "$action" = install ]; then
+    old_ok "$SYSTEM" && old_ok "$ACTIVE" || fail 'baseline SI required at both paths'
+    [ "$(token_status)" = ABSENT ] || fail 'arm token must be absent'
+    check 2960431692 2645 /mnt/app/eso/hmi/lsd/jars/NavActiveIgnore.jar || fail 'Stage2 must be rolled back'
+    if exists /mnt/app/eso/hmi/lsd/jars/CarPlayRGI-MU1320-Stage2.jar; then fail 'Stage2 still installed'; fi
+    check @DIO_OLD_CRC@ @DIO_OLD_SIZE@ /etc/eso/production/dio_manager.json || fail 'active dio config differs'
+    check @DIO_OLD_CRC@ @DIO_OLD_SIZE@ /mnt/system/etc/eso/production/dio_manager.json || fail 'system dio config differs'
+    @PAYLOAD_CHECKS@
+    if exists "$ROOT"; then
+        [ -d "$ROOT/backup" ] && [ ! -L "$ROOT" ] && [ ! -L "$ROOT/backup" ] || fail 'existing workspace is not a resumable directory'
+        [ "$(dir_attrs "$ROOT/backup")" = 'drwx------ 0 0' ] || fail 'runtime backup directory attributes'
+        runtime_ok
+        old_ok "$ROOT/backup/smartphone_integrator.json" || fail 'resumable backup changed'
+        resume_workspace=1
+        echo 'RESUME_WORKSPACE_VERIFIED: continuing a prior pre-commit install'
+    fi
+else
+    disarm
+    if old_ok "$SYSTEM"; then echo 'ROLLBACK_ALREADY_BASELINE: full restart is still required if SI used trial config'; exit 0; fi
+    new_ok "$SYSTEM" || fail 'system config is not this trial; preserve it'
+    [ -d "$ROOT/backup" ] && [ ! -L "$ROOT" ] && [ ! -L "$ROOT/backup" ] || fail 'unsafe backup directory'
+    check @IDENTITY_CRC@ @IDENTITY_SIZE@ "$ROOT/IDENTITY" || fail 'identity mismatch'
+    old_ok "$ROOT/backup/smartphone_integrator.json" || fail 'rollback backup changed'
+fi
+witness="/tmp/mu1320-navhook-v1-$action-witness"; witness_preexists=0
+if exists "$witness"; then [ -f "$witness" ] && [ ! -L "$witness" ] && [ "$(attrs "$witness")" = '-rw------- 0 0' ] && [ "$(cat "$witness")" = "$MARKER" ] || fail 'unknown boot witness'; witness_preexists=1; fi
+restore_app=0; restore_system=0; completed=0
+cleanup() {
+    rc=$?; trap - 0 1 2 15; set +e; sync || rc=1
+    if [ "$restore_system" = 1 ]; then mount -ur /mnt/system || rc=1; fi
+    if [ "$restore_app" = 1 ]; then mount -ur /mnt/app || rc=1; fi
+    final_app=$(state /mnt/app); aq=$?; final_system=$(state /mnt/system); sq=$?
+    if [ "$aq" != 0 ] || [ "$sq" != 0 ] || [ "$final_app:$final_system" != "$app_state:$system_state" ]; then echo 'STOP: original mounts not restored' >&2; rc=1; else echo "MOUNTS_RESTORED: app=$final_app system=$final_system"; fi
+    if [ "$rc" = 0 ] && [ "$completed" = 1 ]; then echo "NAVHOOK_${action}_FILES_PASSED: no restart performed"; elif [ "$action" = install ]; then echo 'INSTALL_INCOMPLETE: run rollback before restart' >&2; fi
+    exit "$rc"
+}
+trap cleanup 0; trap 'exit 129' 1; trap 'exit 130' 2; trap 'exit 143' 15
+if [ "$action" = install ]; then
+    if [ "$resume_workspace" = 0 ] && [ "$app_state" = ro ]; then
+        restore_app=1; mount -uw /mnt/app || fail 'app remount rw'
+    fi
+    if [ "$resume_workspace" = 0 ]; then
+        [ "$(state /mnt/app)" = rw ] || fail 'app not writable'
+        echo 'INSTALL_STEP: create private runtime workspace'
+        umask 077; mkdir "$ROOT" "$ROOT/backup" "$ROOT/config" || fail 'runtime mkdir'
+        cp "$stage_dir/IDENTITY" "$ROOT/IDENTITY" || fail 'identity copy'
+        cp -p "$SYSTEM" "$ROOT/backup/smartphone_integrator.json" || fail 'SI backup copy'
+        cp "$stage_dir/libcarplay_hook.so" "$ROOT/libcarplay_hook.so" || fail 'hook copy'
+        cp "$stage_dir/dio_manager.json" "$ROOT/config/dio_manager.json" || fail 'DIO config copy'
+        chmod 644 "$ROOT/libcarplay_hook.so" "$ROOT/config/dio_manager.json" || fail 'runtime chmod'
+    else
+        echo 'INSTALL_STEP: reuse verified private runtime workspace'
+    fi
+    old_ok "$ROOT/backup/smartphone_integrator.json" || fail 'backup validation'
+    runtime_ok
+    sync || fail 'sync private runtime workspace'
+    run_clean "$stage_dir/loader_check" "$ROOT/libcarplay_hook.so" || fail 'standalone hook loader; SI not patched'
+    source="$stage_dir/smartphone_integrator.json"
+else source="$ROOT/backup/smartphone_integrator.json"; fi
+umask 077
+if [ "$witness_preexists" = 0 ]; then (set -C; printf '%s\n' "$MARKER" > "$witness") || fail 'boot witness creation'; fi
+if [ "$system_state" = ro ]; then restore_system=1; fi
+if [ "$system_state" = ro ]; then
+    echo "${action}_STEP: remount /mnt/system rw"
+    mount -uw /mnt/system || fail 'system remount rw'
+fi
+[ "$(state /mnt/system)" = rw ] || fail 'system not writable'
+pending="/mnt/system/etc/eso/production/.mu1320-navhook-$action.$$"
+if exists "$pending"; then fail 'system temporary collision'; fi
+echo "${action}_STEP: write pending SI"
+if [ "$action" = rollback ]; then cp -p "$source" "$pending" || fail 'pending SI restore copy'; else cp "$source" "$pending" || fail 'pending SI install copy'; fi
+chmod 644 "$pending" || fail 'pending SI chmod'
+if [ "$action" = install ]; then new_ok "$pending" || fail 'pending candidate validation'; else old_ok "$pending" || fail 'pending restore validation'; fi
+sync || fail 'sync before SI commit'
+echo "${action}_STEP: commit SI rename"
+mv "$pending" "$SYSTEM" || fail 'SI commit rename'
+if [ "$action" = install ]; then new_ok "$SYSTEM" || fail 'installed candidate validation'; else old_ok "$SYSTEM" || fail 'restored SI validation'; fi
+sync || fail 'sync after SI commit'; completed=1

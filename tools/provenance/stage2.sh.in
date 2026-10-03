@@ -1,0 +1,198 @@
+#!/bin/sh
+# Stage2 modifies only two Java archive paths on /mnt/app. No restart or native preload.
+set -eu
+PATH=/proc/boot:/bin:/usr/bin:/sbin:/usr/sbin:/mnt/app/armle/bin:/mnt/app/armle/usr/bin
+export PATH
+[ "$#" -eq 1 ] || { echo 'usage: stage2.sh status|install|rollback|collect'; exit 2; }
+action=$1
+case "$action" in status|install|rollback|collect) ;; *) exit 2 ;; esac
+case "$0" in */*) stage_dir=${0%/*} ;; *) exit 2 ;; esac
+stage_dir=$(CDPATH= cd "$stage_dir" && pwd -P)
+WORK=/mnt/app/root/mu1320-rgi-stage2-v2
+JARS=/mnt/app/eso/hmi/lsd/jars
+OLD=$JARS/NavActiveIgnore.jar
+NEW=$JARS/CarPlayRGI-MU1320-Stage2.jar
+PRIOR=/mnt/app/root/mu1320-rgi-stage1-v2/backup/NavActiveIgnore.jar
+fail() { echo "STOP: $*" >&2; exit 1; }
+for utility in id uname cksum ls cat; do
+    command -v "$utility" >/dev/null 2>&1 || fail "missing $utility"
+done
+if [ "$action" = install ] || [ "$action" = rollback ]; then
+    for utility in cmp cp mv chmod mkdir sync find mount; do
+        command -v "$utility" >/dev/null 2>&1 || fail "missing $utility"
+    done
+fi
+uid_output=$(id -u) || fail 'id query failed'
+set -f
+set -- $uid_output
+[ "$#" -eq 1 ] && [ "$1" = 0 ] || fail 'numeric effective UID 0 required'
+case "$(uname -a)" in QNX\ *\ 6.5.0\ *\ armle) ;; *) fail 'wrong platform' ;; esac
+for directory in /mnt/app/root /mnt/app/eso /mnt/app/eso/hmi /mnt/app/eso/hmi/lsd "$JARS"; do
+    [ -d "$directory" ] && [ ! -L "$directory" ] || fail "unsafe directory $directory"
+done
+exists() { [ -e "$1" ] || [ -L "$1" ]; }
+check_file() {
+    [ -f "$3" ] && [ ! -L "$3" ] || return 1
+    check_crc=$1; check_size=$2
+    check_output=$(cksum "$3") || return 1
+    set -- $check_output
+    [ "${1:-}" = "$check_crc" ] && [ "${2:-}" = "$check_size" ]
+}
+attributes() {
+    attr_output=$(LC_ALL=C ls -ln "$1") || return 1
+    set -- $attr_output
+    [ "$#" -ge 5 ] || return 1
+    printf '%s %s %s\n' "$1" "$3" "$4"
+}
+old_ok() { check_file @OLD_CRC@ @OLD_SIZE@ "$1" && [ "$(attributes "$1")" = '-rwxrwxrwx 0 0' ]; }
+new_ok() { check_file @NEW_CRC@ @NEW_SIZE@ "$1" && [ "$(attributes "$1")" = '-rw-r--r-- 0 0' ]; }
+run_clean() {
+    (
+        for var in LD_PRELOAD LD_DEBUG DL_DEBUG LD_DEBUG_OUTPUT; do unset "$var" || :; done
+        LD_LIBRARY_PATH=/proc/boot:/lib exec "$@"
+    )
+}
+check_file @MOUNT_CRC@ @MOUNT_SIZE@ "$stage_dir/mount_state" || fail 'mount helper checksum'
+check_file 3727885851 560715 /proc/boot/libc.so.3 || fail 'libc differs from tested baseline'
+state() { run_clean "$stage_dir/mount_state"; }
+file_status() {
+    if exists "$NEW"; then
+        new_ok "$NEW" || fail 'unknown Stage2 archive; preserve it'
+        if exists "$OLD"; then old_ok "$OLD" || fail 'unknown original archive'; echo 'FILES: BOTH_PRESENT_REQUIRES_ROLLBACK';
+        else echo 'FILES: STAGE2_INSTALLED'; fi
+    elif exists "$OLD"; then
+        old_ok "$OLD" || fail 'NavActiveIgnore differs from baseline'
+        echo 'FILES: INSTALLATION_BASELINE'
+    else echo 'FILES: BOTH_ABSENT_REQUIRES_ROLLBACK'; fi
+}
+file_status
+if [ "$action" = status ] || [ "$action" = collect ]; then
+    current_mount=$(state) || fail 'mount query failed'
+    case "$current_mount" in ro|rw) ;; *) fail 'unknown mount state' ;; esac
+    echo "MOUNT: /mnt/app $current_mount"
+    if [ -f "$WORK/phase.txt" ] && [ ! -L "$WORK/phase.txt" ]; then cat "$WORK/phase.txt"; fi
+    if [ "$action" = collect ]; then
+        echo 'STAGE2_JAVA_LOG_BEGIN (may contain private route/media information)'
+        if [ -f /tmp/carplay_java.log ]; then cat /tmp/carplay_java.log; else echo 'NO_JAVA_LOG'; fi
+        echo 'STAGE2_JAVA_LOG_END'
+    fi
+    echo 'STATUS_IS_FILE_STATE_ONLY: HMI reload and Java execution are not inferred.'
+    exit 0
+fi
+if [ "$action" = install ]; then
+    exists "$WORK" && fail 'Stage2 workspace exists; preserve it and use rollback, do not reinstall'
+    exists "$NEW" && fail 'Stage2 archive already exists'
+    old_ok "$OLD" || fail 'original NavActiveIgnore content/attributes differ'
+    old_ok "$PRIOR" || fail 'verified Stage1 backup missing or changed'
+    check_file @NEW_CRC@ @NEW_SIZE@ "$stage_dir/carplay_mu1320_stage2.jar.DISABLED" || fail 'Stage2 payload checksum'
+    @BASELINE_CHECKS@
+    # Reject unexpected recursively scanned archives; no backups may live under jars/.
+    archive_listing=$(find "$JARS" \( -name '*.jar' -o -name '*.zip' \)) || fail 'cannot enumerate HMI archives'
+    while IFS= read -r archive; do
+        case "$archive" in
+@ARCHIVE_CASES@
+            *) fail "unknown HMI archive: $archive" ;;
+        esac
+    done <<ARCHIVE_LIST
+$archive_listing
+ARCHIVE_LIST
+else
+    if ! exists "$NEW" && old_ok "$OLD"; then
+        echo 'ROLLBACK_ALREADY_BASELINE: no files changed; restart normally if Java was loaded.'
+        exit 0
+    fi
+    [ -d "$WORK" ] && [ ! -L "$WORK" ] || fail 'Stage2 workspace missing/unsafe'
+    check_file @IDENTITY_CRC@ @IDENTITY_SIZE@ "$WORK/IDENTITY" || fail 'workspace identity differs'
+    [ -d "$WORK/backup" ] && [ ! -L "$WORK/backup" ] || fail 'backup directory unsafe'
+    old_ok "$WORK/backup/NavActiveIgnore.jar" || fail 'rollback original backup missing or changed'
+    if exists "$NEW"; then new_ok "$NEW" || fail 'unknown active Stage2 archive'; fi
+    if exists "$OLD"; then old_ok "$OLD" || fail 'unknown active original archive'; fi
+fi
+initial_mount=$(state) || fail 'mount query failed'
+case "$initial_mount" in ro|rw) ;; *) fail 'unknown mount state' ;; esac
+echo "MOUNT_INITIAL: /mnt/app $initial_mount"
+restore_ro=0
+completed=0
+cleanup() {
+    result=$?
+    trap - 0 1 2 15
+    set +e
+    if [ "$restore_ro" -eq 1 ]; then
+        sync || result=1
+        mount -ur /mnt/app || { echo 'STOP: run sync; mount -ur /mnt/app when SSH remains available' >&2; result=1; }
+    fi
+    final_mount=$(state); query_result=$?
+    if [ "$query_result" -ne 0 ] || [ "$final_mount" != "$initial_mount" ]; then
+        echo 'STOP: original mount state not verified' >&2; result=1
+    else echo "MOUNT_RESTORED: /mnt/app $final_mount"; fi
+    if [ "$result" -eq 0 ] && [ "$completed" -eq 1 ]; then
+        echo "STAGE2_${action}_FILES_PASSED: restart normally to apply; no restart was performed"
+    elif [ "$action" = install ]; then
+        echo 'INSTALL_INCOMPLETE: preserve output; run stage2.sh rollback BEFORE any planned restart.' >&2
+    fi
+    exit "$result"
+}
+trap cleanup 0
+trap 'exit 129' 1
+trap 'exit 130' 2
+trap 'exit 143' 15
+if [ "$initial_mount" = ro ]; then restore_ro=1; mount -uw /mnt/app || fail 'remount failed'; fi
+[ "$(state)" = rw ] || fail 'filesystem is not writable'
+phase() {
+    phase_tmp="$WORK/phase.pending.$$"
+    exists "$phase_tmp" && fail 'journal temporary collision'
+    if exists "$WORK/phase.txt"; then
+        [ -f "$WORK/phase.txt" ] && [ ! -L "$WORK/phase.txt" ] || fail 'unsafe journal file'
+    fi
+    printf '%s\n' "$1" > "$phase_tmp"
+    mv -f "$phase_tmp" "$WORK/phase.txt"
+    sync
+}
+if [ "$action" = install ]; then
+    umask 077
+    mkdir "$WORK"
+    printf 'MU1320-STAGE2-PASSIVE-V2\n' > "$WORK/IDENTITY"
+    mkdir "$WORK/backup" "$WORK/quarantine"
+    cp -p "$OLD" "$WORK/backup/NavActiveIgnore.jar"
+    old_ok "$WORK/backup/NavActiveIgnore.jar" || fail 'backup content or attributes differ'
+    cmp "$OLD" "$WORK/backup/NavActiveIgnore.jar" >/dev/null || fail 'original changed during backup'
+    phase BACKUP_VERIFIED
+    pending="$JARS/.mu1320-stage2.pending"
+    exists "$pending" && fail 'pending Stage2 file exists; preserve it'
+    cp "$stage_dir/carplay_mu1320_stage2.jar.DISABLED" "$pending"
+    chmod 644 "$pending"
+    # The root process creates this file. Verify uid/gid explicitly instead of
+    # depending on a chown utility, which is absent on the tested MU1320 image.
+    new_ok "$pending" || fail 'pending Stage2 validation'
+    phase PAYLOAD_VERIFIED
+    # Backup is complete before either active file is changed.
+    mv "$OLD" "$WORK/quarantine/NavActiveIgnore.jar"
+    old_ok "$WORK/quarantine/NavActiveIgnore.jar" || fail 'quarantine verification'
+    phase ORIGINAL_QUARANTINED
+    mv "$pending" "$NEW"
+    new_ok "$NEW" || fail 'installed Stage2 validation'
+    ! exists "$OLD" || fail 'old patch unexpectedly present'
+    phase STAGE2_INSTALLED
+else
+    # Move the new jar out first, then restore original. Every step is retryable.
+    if exists "$NEW"; then
+        removed="$WORK/removed-stage2.$$"
+        exists "$removed" && fail 'rollback destination collision'
+        mv "$NEW" "$removed"
+        new_ok "$removed" || fail 'removed Stage2 validation'
+        phase STAGE2_REMOVED
+    fi
+    if ! exists "$OLD"; then
+        pending="$JARS/.mu1320-original-restore.$$"
+        exists "$pending" && fail 'restore temporary collision'
+        cp -p "$WORK/backup/NavActiveIgnore.jar" "$pending"
+        old_ok "$pending" || fail 'restore temporary validation'
+        sync
+        mv "$pending" "$OLD"
+    fi
+    old_ok "$OLD" || fail 'restored original validation'
+    ! exists "$NEW" || fail 'Stage2 still active'
+    phase INSTALLATION_BASELINE_RESTORED
+fi
+sync
+completed=1

@@ -1,0 +1,45 @@
+#!/bin/sh
+# SD wrapper for the read-only /mnt/app/root inventory. Only the SD card is remounted (and
+# restored); /mnt/app and /mnt/system are never remounted or written.
+set -eu
+for var in LD_PRELOAD LD_DEBUG DL_DEBUG LD_DEBUG_OUTPUT; do unset "$var" || :; done
+PATH=/proc/boot:/bin:/usr/bin:/sbin:/usr/sbin:/mnt/app/armle/bin:/mnt/app/armle/usr/bin
+export PATH
+case "$*: $#" in
+  'run: 1') ;;
+  *) echo 'usage: root_inventory.sh run'; exit 2 ;;
+esac
+case "$0" in */*) stage_dir=${0%/*} ;; *) exit 2 ;; esac
+stage_dir=$(CDPATH= cd "$stage_dir" && pwd -P)
+case "$stage_dir" in /fs/sda0/*) sd=/fs/sda0 ;; /fs/sdb0/*) sd=/fs/sdb0 ;; *) echo 'STOP: use SD /fs/sda0 or /fs/sdb0'; exit 2 ;; esac
+fail() { echo "STOP: $*" >&2; exit 1; }
+uid=$(id -u); set -f; (set -- $uid; [ "$#" = 1 ] && [ "$1" = 0 ]) || fail 'effective UID must be 0'
+case "$(uname -a)" in QNX\ *\ 6.5.0\ *\ armle) ;; *) fail 'wrong platform' ;; esac
+output=$(cksum "$stage_dir/mount_state"); set -- $output; [ "${1:-}" = '@MOUNT_CKSUM@' ] && [ "${2:-}" = '@MOUNT_SIZE@' ] || fail 'mount helper checksum'
+output=$(cksum "$stage_dir/control.sh"); set -- $output; [ "${1:-}" = '@CONTROL_CKSUM@' ] && [ "${2:-}" = '@CONTROL_SIZE@' ] || fail 'control checksum'
+set +f
+state() { (LD_LIBRARY_PATH=/proc/boot:/lib exec "$stage_dir/mount_state" "$sd"); }
+initial=$(state) || fail 'SD mount query'; case "$initial" in ro|rw) ;; *) fail 'unknown SD mount state' ;; esac
+restore=0; log=''; completed=0; control_rc=255
+cleanup() {
+    outer_rc=$?; trap - 0 1 2 15; set +e
+    if [ -n "$log" ] && [ -f "$log" ]; then printf 'CONTROL_EXIT=%s\nOUTER_EXIT_BEFORE_SD_CLEANUP=%s\nSD_INITIAL=%s\n' "$control_rc" "$outer_rc" "$initial" >> "$log"; sync || outer_rc=1; fi
+    if [ "$restore" = 1 ]; then mount -ur "$sd" || outer_rc=1; fi
+    final=$(state); query=$?
+    if [ "$query" != 0 ] || [ "$final" != "$initial" ]; then echo "STOP: SD state not restored to $initial; do not remove card" >&2; outer_rc=1
+    else echo "SD_MOUNT_RESTORED: $sd=$final"; fi
+    [ -z "$log" ] || echo "ACTION_LOG_ON_SD: $log"
+    echo "CONTROL_EXIT: $control_rc"; echo "OUTER_EXIT: $outer_rc"
+    if [ "$outer_rc" = 0 ] && [ "$completed" = 1 ]; then echo 'ROOT_INVENTORY_PASSED'; fi
+    exit "$outer_rc"
+}
+trap cleanup 0; trap 'exit 129' 1; trap 'exit 130' 2; trap 'exit 143' 15
+if [ "$initial" = ro ]; then restore=1; mount -uw "$sd" || fail 'SD remount rw'; fi
+[ "$(state)" = rw ] || fail 'SD not writable'
+umask 077; out="$stage_dir/out"; [ ! -L "$out" ] || fail 'unsafe out directory'; [ -d "$out" ] || mkdir "$out"
+log="$out/action-run-$$.txt"; [ ! -e "$log" ] && [ ! -L "$log" ] || fail 'action log collision'
+set +e
+(set -C; /bin/sh "$stage_dir/control.sh" run > "$log" 2>&1)
+control_rc=$?; set -e
+cat "$log"
+[ "$control_rc" = 0 ] || exit "$control_rc"; completed=1

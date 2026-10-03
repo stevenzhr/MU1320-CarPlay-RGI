@@ -1,0 +1,160 @@
+#!/bin/sh
+# MU1320 /mnt/app/root trial-leftover cleanup. Run only through root_cleanup.sh (SD wrapper).
+# status: read-only verification.  delete: the same verification, then removes exactly the
+# files and directories recorded by the root inventory (@INVENTORY@), one path at a time:
+# no recursive rm, no wildcard delete, /mnt/system is never remounted or written.
+# Anything under a whitelisted directory that the inventory did not record (extra file,
+# changed checksum, symlink) stops the run before the first removal.
+set -u
+for var in LD_PRELOAD LD_DEBUG DL_DEBUG LD_DEBUG_OUTPUT; do unset "$var" || :; done
+PATH=/proc/boot:/bin:/usr/bin:/sbin:/usr/sbin:/mnt/app/armle/bin:/mnt/app/armle/usr/bin
+export PATH
+case "$*: $#" in 'status: 1'|'delete: 1') ;; *) echo 'usage: control.sh status|delete'; exit 2 ;; esac
+action=$1
+case "$0" in */*) stage_dir=${0%/*} ;; *) exit 2 ;; esac
+stage_dir=$(CDPATH= cd "$stage_dir" && pwd -P)
+fail() { echo "STOP: $*"; exit 1; }
+exists() { [ -e "$1" ] || [ -L "$1" ]; }
+
+ROOT=/mnt/app/root
+SI=/mnt/system/etc/eso/production/smartphone_integrator.json
+DIO=/mnt/system/etc/eso/production/dio_manager.json
+ASI=/etc/eso/production/smartphone_integrator.json
+ADIO=/etc/eso/production/dio_manager.json
+NAI=/mnt/app/eso/hmi/lsd/jars/NavActiveIgnore.jar
+WHITELIST='@WHITELIST@'
+EXPECTED_COUNT=@EXPECTED_COUNT@
+MAX_DEPTH=12
+
+check() { [ -f "$3" ] && [ ! -L "$3" ] || return 1; c=$1; n=$2; output=$(cksum "$3") || return 1; set -f; set -- $output; set +f; [ "${1:-}" = "$c" ] && [ "${2:-}" = "$n" ]; }
+run_clean() { (for var in LD_PRELOAD LD_DEBUG DL_DEBUG LD_DEBUG_OUTPUT; do unset "$var" || :; done; LD_LIBRARY_PATH=/proc/boot:/lib exec "$@"); }
+state() { run_clean "$stage_dir/mount_state" "$1"; }
+
+# One record per inventoried path: D <dir> or F <cksum> <size> <file>.
+expected_entry() {
+    case "$1" in
+@EXPECTED_CASE@
+    esac
+    return 1
+}
+
+for utility in id uname ls cksum cat pidin; do command -v "$utility" >/dev/null 2>&1 || fail "missing $utility"; done
+if [ "$action" = delete ]; then
+    for utility in rm rmdir mount sync; do command -v "$utility" >/dev/null 2>&1 || fail "missing $utility"; done
+fi
+check @MOUNT_SUM@ "$stage_dir/mount_state" || fail 'mount helper checksum'
+out="$stage_dir/out"
+if [ ! -d "$out" ] || [ -L "$out" ]; then fail 'out directory'; fi
+run="$out/$action-$$"
+if exists "$run"; then fail 'run directory collision'; fi
+mkdir "$run" || fail 'cannot create run directory on SD'
+echo "ROOT_CLEANUP_V1 action=$action run=$run"
+
+echo '== Baseline (must equal the inventory) =='
+check 535418540 7359 "$SI" || fail 'system smartphone_integrator.json is not the inventoried baseline (another trial installed?)'
+check 535418540 7359 "$ASI" || fail 'active smartphone_integrator.json is not the inventoried baseline'
+check 3919119664 15734 "$DIO" || fail 'system dio_manager.json is not the inventoried baseline'
+check 3919119664 15734 "$ADIO" || fail 'active dio_manager.json is not the inventoried baseline'
+check 2960431692 2645 "$NAI" || fail 'NavActiveIgnore.jar is not the inventoried baseline'
+echo 'BASELINE_CONFIG: OK'
+if procs=$(pidin ar 2>/dev/null); then :; else fail 'pidin failed'; fi
+case "$procs" in *"$ROOT/mu1320"*) fail 'a running process references /mnt/app/root/mu1320*' ;; esac
+echo 'NO_PROCESS_REFERENCES: OK'
+if [ ! -d "$ROOT" ] || [ -L "$ROOT" ]; then fail 'unsafe /mnt/app/root'; fi
+
+walk() (
+    p=$1; depth=$2
+    if [ -L "$p" ]; then echo "L $p"; return 0; fi
+    if [ -d "$p" ]; then
+        echo "D $p"
+        if [ "$depth" -ge "$MAX_DEPTH" ]; then echo "X $p"; return 0; fi
+        for c in "$p"/* "$p"/.[!.]* "$p"/..?*; do
+            if exists "$c"; then walk "$c" $((depth + 1)); fi
+        done
+        return 0
+    fi
+    if [ -f "$p" ]; then
+        if line=$(cksum "$p" 2>/dev/null); then set -f; set -- $line; set +f; echo "F $1 $2 $p"; else echo "U $p"; fi
+        return 0
+    fi
+    echo "O $p"
+)
+
+in_whitelist() { case " $WHITELIST " in *" $1 "*) return 0 ;; esac; return 1; }
+
+# survey FILE: records every whitelisted path into FILE and prints the other top-level entries.
+survey() {
+    : > "$1" || fail 'survey file'
+    for e in "$ROOT"/* "$ROOT"/.[!.]* "$ROOT"/..?*; do
+        if exists "$e"; then :; else continue; fi
+        name=${e##*/}
+        if in_whitelist "$name"; then walk "$e" 1 >> "$1"; else echo "KEEP $name"; fi
+    done
+    for name in $WHITELIST; do
+        if exists "$ROOT/$name"; then echo "TRIAL_PRESENT $name"; else echo "TRIAL_ABSENT $name"; fi
+    done
+}
+
+# verify FILE: every recorded path must be one the inventory recorded (missing ones are
+# allowed so an interrupted delete can resume).  Sets PRESENT to the matched count.
+verify() {
+    PRESENT=0; unexpected=0
+    while read -r record; do
+        if expected_entry "$record"; then PRESENT=$((PRESENT + 1)); else echo "UNEXPECTED $record"; unexpected=$((unexpected + 1)); fi
+    done < "$1"
+    if [ "$unexpected" != 0 ]; then fail "$unexpected unexpected entries under whitelisted directories; nothing deleted"; fi
+    echo "VERIFIED: $PRESENT of $EXPECTED_COUNT inventoried entries present, 0 unexpected"
+}
+
+survey "$run/before.txt"
+verify "$run/before.txt"
+if [ "$PRESENT" = "$EXPECTED_COUNT" ]; then echo 'CLEANUP_STATE: NOT_STARTED'
+elif [ "$PRESENT" = 0 ]; then echo 'CLEANUP_STATE: DONE'
+else echo 'CLEANUP_STATE: PARTIAL'; fi
+
+if [ "$action" = status ]; then echo 'ROOT_CLEANUP_STATUS_OK'; exit 0; fi
+
+if [ "$PRESENT" = 0 ]; then echo 'NOTHING_TO_DELETE'; echo 'ROOT_CLEANUP_COMPLETE'; exit 0; fi
+
+app_state=$(state /mnt/app) || fail 'app mount query'
+case "$app_state" in ro|rw) ;; *) fail 'unknown /mnt/app mount state' ;; esac
+restore_app=0; completed=0
+cleanup() {
+    rc=$?; trap - 0 1 2 15; set +e; sync || rc=1
+    if [ "$restore_app" = 1 ]; then mount -ur /mnt/app || rc=1; fi
+    final=$(state /mnt/app); q=$?
+    if [ "$q" != 0 ] || [ "$final" != "$app_state" ]; then echo "STOP: /mnt/app not restored to $app_state" >&2; rc=1
+    else echo "APP_MOUNT_RESTORED: /mnt/app=$final"; fi
+    if [ "$completed" != 1 ]; then echo 'DELETE_INCOMPLETE: run status, then delete again to resume'; fi
+    exit "$rc"
+}
+trap cleanup 0; trap 'exit 129' 1; trap 'exit 130' 2; trap 'exit 143' 15
+if [ "$app_state" = ro ]; then restore_app=1; mount -uw /mnt/app || fail 'app remount rw'; fi
+[ "$(state /mnt/app)" = rw ] || fail '/mnt/app not writable'
+
+removed=0
+del_file() {
+    if exists "$3"; then :; else return 0; fi
+    check "$1" "$2" "$3" || fail "changed before removal: $3"
+    rm -f "$3" < /dev/null || fail "rm failed: $3"
+    if exists "$3"; then fail "still present: $3"; fi
+    removed=$((removed + 1))
+}
+del_dir() {
+    if exists "$1"; then :; else return 0; fi
+    if [ ! -d "$1" ] || [ -L "$1" ]; then fail "not a directory: $1"; fi
+    rmdir "$1" || fail "rmdir failed (not empty?): $1"
+    removed=$((removed + 1))
+}
+
+echo '== Deleting inventoried entries =='
+@DELETE_STEPS@
+sync || fail 'sync'
+echo "REMOVED: $removed"
+
+survey "$run/after.txt"
+verify "$run/after.txt"
+[ "$PRESENT" = 0 ] || fail "$PRESENT inventoried entries still present"
+for name in $WHITELIST; do if exists "$ROOT/$name"; then fail "still present: $name"; fi; done
+completed=1
+echo 'ROOT_CLEANUP_COMPLETE'

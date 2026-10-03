@@ -1,0 +1,49 @@
+--- stage1/hook/framework/hook_framework.c
++++ navhook/hook/framework/hook_framework.c
+@@
+ #include "hook_framework.h"
++#include "trial_gate.h"
+@@
+ int CinemoCreateIAP(void* args) {
++    int trial_active = trial_gate_active();
+@@
+     ret = g_fw.real_cinemo_create_iap(args);
++    if (!trial_active) return ret;
+@@
+ int _ZN14NmeIAP2Message6DecodeEPKhi(void* self, const uint8_t* buf, int len) {
+-    if (!g_fw.initialized || (!g_fw.bus_started && !g_fw.bus_disabled))
++    int trial_active = trial_gate_active();
++    if (trial_active && (!g_fw.initialized || (!g_fw.bus_started && !g_fw.bus_disabled)))
+@@
+     if (g_fw.real_decode) ret = g_fw.real_decode(self, buf, len);
++    if (!trial_active) return ret;
+@@
+ int _ZNK14NmeIAP2Message6EncodeER8NmeArrayIhE(const void* self, void* out_array) {
+-    if (!g_fw.initialized || (!g_fw.bus_started && !g_fw.bus_disabled))
++    int trial_active = trial_gate_active();
++    if (trial_active && (!g_fw.initialized || (!g_fw.bus_started && !g_fw.bus_disabled)))
+@@
+     if (g_fw.real_encode) ret = g_fw.real_encode(self, out_array);
++    if (!trial_active) return ret;
+@@
+ int _ZN12NmeTransport4SendEPKhjPj(void* self, const uint8_t* buf, unsigned int len, unsigned int* sent) {
++    int trial_active = trial_gate_active();
+@@
+-    if (!g_fw.initialized || (!g_fw.bus_started && !g_fw.bus_disabled))
++    if (trial_active && (!g_fw.initialized || (!g_fw.bus_started && !g_fw.bus_disabled)))
+@@
+     ret = g_fw.real_transport_send(self, buf, len, sent);
++    if (!trial_active) return ret;
+@@
+ int _ZN12NmeTransport4RecvER8NmeArrayIhE(void* self, void* out_array) {
+-    if (!g_fw.initialized || (!g_fw.bus_started && !g_fw.bus_disabled))
++    int trial_active = trial_gate_active();
++    if (trial_active && (!g_fw.initialized || (!g_fw.bus_started && !g_fw.bus_disabled)))
+@@
+     int ret = g_fw.real_transport_recv(self, out_array);
++    if (!trial_active) return ret;
+@@
+ static void hook_lib_fini(void) {
+-    hook_framework_shutdown();
++    if (trial_gate_was_active()) hook_framework_shutdown();
+ }

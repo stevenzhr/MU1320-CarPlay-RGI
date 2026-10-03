@@ -1,0 +1,210 @@
+# MU1320 F5 displaymanager/renderer helpers, sourced by control.sh and
+# collect_f5.sh after their checksum check.  Derived from the F4 control.sh
+# that ran on the car (v1 run4).  Caller provides: fail, exists, check, UNBUF
+# (path of f4_unbuf.so) and DMP (prefix for query output files; /tmp cannot
+# hold directories on this unit).
+# Never call "dmdt ts": on this unit it hung displaymanager and the MMI rebooted (F4 run2).
+DMDT=/mnt/app/eso/bin/apps/dmdt
+# dmdt addresses displaymanager INTERNAL display ids: cluster (external 1) = 4.
+DISPLAY_ID=4
+CTX=80
+TEST_LIST='98 102 101 33'
+RENDER_DIR=@RUNTIME@/render
+RPID=/tmp/mu1320-f5-renderer.pid
+RLOG=/tmp/mu1320-f5-renderer.log
+
+# dm OUT ARGS...: dmdt with a 10 s watchdog; output (and any timeout) in OUT.
+# dmdt leaves via _Exit() without flushing stdio: f4_unbuf.so makes stdout
+# unbuffered.  The child is reaped by wait (kill -0 sees unreaped zombies).
+# The watchdog is stopped with SIGKILL: processes started from the HMI JVM
+# (the F5 context helper) inherit SIGTERM ignored, and a plain kill left every
+# dm call waiting the full 10 s (F5 v2 car run: 20 s per native switch).
+dm() {
+    dm_out=$1; shift
+    (for var in LD_PRELOAD LD_DEBUG DL_DEBUG LD_DEBUG_OUTPUT; do unset "$var" || :; done
+     LD_PRELOAD=$UNBUF LD_LIBRARY_PATH=/proc/boot:/lib exec "$DMDT" "$@" > "$dm_out" 2>&1) &
+    dm_pid=$!
+    (sleep 10; kill -9 "$dm_pid" 2>/dev/null) &
+    dm_wd=$!
+    dm_rc=0; wait "$dm_pid" || dm_rc=$?
+    kill -9 "$dm_wd" 2>/dev/null || :; wait "$dm_wd" 2>/dev/null || :
+    if [ "$dm_rc" = 137 ]; then echo "DMDT_TIMEOUT $*" >> "$dm_out" 2>/dev/null || :; echo "DMDT_TIMEOUT $*"; return 124; fi
+    return "$dm_rc"
+}
+
+# parse_gs FILE -> CL_CTX, CL_LIST (cluster = LVDS2), MAIN_CTX
+parse_gs() {
+    CL_CTX=''; CL_LIST=''; MAIN_CTX=''; gs_in=0; gs_main=0
+    [ -r "$1" ] || return 0
+    while read -r gs_a gs_b gs_c gs_rest || [ -n "$gs_a" ]; do
+        if [ "$gs_a $gs_b" = 'terminal: LVDS1' ]; then gs_main=1; continue; fi
+        if [ "$gs_main" = 1 ] && [ "$gs_a $gs_b" = 'context id:' ]; then MAIN_CTX=$gs_c; gs_main=2; continue; fi
+        if [ "$gs_a $gs_b" = 'terminal: LVDS2' ]; then gs_in=1; continue; fi
+        if [ "$gs_in" = 1 ] && [ "$gs_a $gs_b" = 'context id:' ]; then CL_CTX=$gs_c; gs_in=2; continue; fi
+        if [ "$gs_in" = 2 ]; then
+            case "$gs_a" in ''|*[!0-9]*) gs_in=3; continue ;; esac
+            case "$gs_b" in '('*) CL_LIST="${CL_LIST:+$CL_LIST }$gs_a" ;; *) gs_in=3 ;; esac
+        fi
+    done < "$1"
+}
+
+# parse_gd FILE -> GD_IDS, GD98 ("type WxH" or empty), GD_COMPLETE (rows == "knows N")
+parse_gd() {
+    GD_IDS=''; GD98=''; gd_n=''; gd_rows=0; GD_COMPLETE=no; GD_COUNT='0/?'
+    [ -r "$1" ] || return 0
+    while read -r gd_id gd_type gd_w gd_x gd_h gd_rest || [ -n "$gd_id" ]; do
+        if [ "$gd_id $gd_type $gd_x" = 'displaymanager knows displayables:' ]; then gd_n=$gd_w; continue; fi
+        case "$gd_id" in ''|*[!0-9-]*) continue ;; esac
+        [ "$gd_x" = x ] || continue
+        GD_IDS="${GD_IDS:+$GD_IDS }$gd_id"; gd_rows=$((gd_rows + 1))
+        if [ "$gd_id" = 98 ]; then GD98="$gd_type ${gd_w}x$gd_h"; fi
+    done < "$1"
+    GD_COMPLETE=no
+    if [ -n "$gd_n" ] && [ "$gd_n" = "$gd_rows" ]; then GD_COMPLETE=yes; fi
+    GD_COUNT="$gd_rows/${gd_n:-?}"
+}
+
+# parse_gc FILE -> GC_FORMAT (parsed|raw|incomplete), GC_IDS, GC_LIST (displayables of $CTX), GC_STOCK (of 74)
+parse_gc() {
+    GC_IDS=''; GC_LIST=''; GC_STOCK=''; gc_cur=''; gc_n=''; gc_rows=0; GC_FORMAT=raw; GC_COUNT='0/?'
+    [ -r "$1" ] || return 0
+    while read -r gc_a gc_b gc_rest || [ -n "$gc_a" ]; do
+        if [ "$gc_a $gc_b" = 'displaymanager knows' ]; then gc_n=${gc_rest%% *}; continue; fi
+        case "$gc_a" in ''|*[!0-9-]*) continue ;; esac
+        if [ "$gc_b" = '|' ]; then gc_cur=$gc_a; GC_IDS="${GC_IDS:+$GC_IDS }$gc_a"; gc_rows=$((gc_rows + 1)); continue; fi
+        case "$gc_b" in
+            '('*)
+                if [ "$gc_cur" = "$CTX" ]; then GC_LIST="${GC_LIST:+$GC_LIST }$gc_a"; fi
+                if [ "$gc_cur" = 74 ]; then GC_STOCK="${GC_STOCK:+$GC_STOCK }$gc_a"; fi ;;
+        esac
+    done < "$1"
+    GC_FORMAT=raw
+    for gc_id in $GC_IDS; do if [ "$gc_id" = 74 ]; then GC_FORMAT=parsed; fi; done
+    if [ "$GC_FORMAT" = parsed ] && [ "$gc_n" != "$gc_rows" ]; then GC_FORMAT=incomplete; fi
+    GC_COUNT="$gc_rows/${gc_n:-?}"
+}
+
+# ctx_declared FILE: 0 if $CTX appears as a context
+ctx_declared() {
+    parse_gc "$1"
+    if [ "$GC_FORMAT" = parsed ]; then
+        for gc_id in $GC_IDS; do if [ "$gc_id" = "$CTX" ]; then return 0; fi; done
+        return 1
+    fi
+    [ -r "$1" ] || return 1
+    while read -r gc_a gc_rest || [ -n "$gc_a" ]; do if [ "$gc_a" = "$CTX" ]; then return 0; fi; done < "$1"
+    return 1
+}
+
+# dm_query: gs/gd/gc into $DMP-*.txt; sets CL_*, GD_*, GC_*, Q_DECLARED and prints a summary.
+dm_query() {
+    dm "$DMP-gs.txt" gs || :; dm "$DMP-gd.txt" gd || :; dm "$DMP-gc.txt" gc || :
+    parse_gs "$DMP-gs.txt"; parse_gd "$DMP-gd.txt"
+    if ctx_declared "$DMP-gc.txt"; then Q_DECLARED=yes; else Q_DECLARED=no; fi
+    echo "DM_CLUSTER_CONTEXT: ${CL_CTX:-UNKNOWN} list=[${CL_LIST}] main=${MAIN_CTX:-UNKNOWN}"
+    echo "DM_DISPLAYABLES: d98=${GD98:-ABSENT} complete=$GD_COMPLETE ($GD_COUNT)"
+    echo "DM_CONTEXT_$CTX: $( [ "$Q_DECLARED" = yes ] && echo "DECLARED list=[$GC_LIST]" || echo ABSENT ) gc_format=$GC_FORMAT ($GC_COUNT)"
+}
+
+renderer_alive() {
+    [ -f "$RPID" ] || return 1
+    r_pid=$(cat "$RPID") || return 1
+    case "$r_pid" in ''|*[!0-9]*) return 1 ;; esac
+    kill -0 "$r_pid" 2>/dev/null || return 1
+    pidin -p "$r_pid" -F '%256n' 2>/dev/null | grep maneuver_render >/dev/null 2>&1
+}
+
+renderer_status() {
+    if renderer_alive; then echo "F5_RENDERER: RUNNING pid=$r_pid"; else echo 'F5_RENDERER: ABSENT'; fi
+}
+
+# render_stop: SIGTERM, 5 s, then SIGKILL.  The renderer blanks 98 on exit
+# (F4: VC clean after exit and SIGKILL); Java releases context 80 when the link drops.
+render_stop() {
+    if renderer_alive; then
+        echo "RENDERER_STOP: pid=$r_pid"
+        kill -TERM "$r_pid" 2>/dev/null || :; n=0
+        while kill -0 "$r_pid" 2>/dev/null && [ "$n" -lt 5 ]; do sleep 1; n=$((n + 1)); done
+        if kill -0 "$r_pid" 2>/dev/null; then kill -9 "$r_pid" 2>/dev/null || :; sleep 1; fi
+    fi
+    rm -f "$RPID" || :
+}
+
+# render_arm: preflight (read-only), start the renderer from the runtime
+# workspace (SIGHUP ignored, so it outlives the SSH session), wait until it has
+# registered 98 and connected to the Java listener, then declare context 80
+# natively (dmdt dc, as F4).  Nothing here switches the cluster: the Java
+# ClusterPresenter does that only while a CarPlay route is shown.
+render_arm() {
+    dm_query
+    [ "$GD_COMPLETE" = yes ] || fail "dmdt gd output incomplete ($GD_COUNT)"
+    [ "$GC_FORMAT" = parsed ] || fail "dmdt gc output $GC_FORMAT ($GC_COUNT)"
+    [ -n "$CL_CTX" ] || fail 'cluster context is UNKNOWN'
+    [ "$CL_CTX" != "$CTX" ] || fail "cluster already on context $CTX; reboot first"
+    if [ "$Q_DECLARED" = yes ] && [ "$GC_LIST" != "$TEST_LIST" ]; then fail "context $CTX declared as [$GC_LIST]; reboot first"; fi
+    started=0
+    if renderer_alive; then
+        echo "RENDERER_ALREADY_RUNNING: pid=$r_pid"
+    else
+        [ -z "$GD98" ] || fail 'displayable 98 exists without our renderer; reboot first'
+        : > "$RLOG" || fail 'renderer log create'
+        ( trap '' 1
+          cd "$RENDER_DIR" || exit 1
+          for var in LD_PRELOAD LD_DEBUG DL_DEBUG LD_DEBUG_OUTPUT; do unset "$var" || :; done
+          LD_LIBRARY_PATH=/proc/boot:/lib GRAPHICS_ROOT=/proc/boot exec "$RENDER_DIR/maneuver_render" < /dev/null >> "$RLOG" 2>&1 ) &
+        echo "$!" > "$RPID" || fail 'renderer pid file'
+        started=1
+        n=0
+        while ! grep 'maneuver_render: ready' "$RLOG" >/dev/null 2>&1; do
+            renderer_alive || fail "renderer exited during init (see $RLOG)"
+            [ "$n" -lt 25 ] || { render_stop; fail 'renderer not ready after 25 s'; }
+            sleep 1; n=$((n + 1))
+        done
+    fi
+    n=0
+    while ! grep 'server: connected to 127.0.0.1:19800' "$RLOG" >/dev/null 2>&1; do
+        [ "$n" -lt 10 ] || { render_stop; fail 'renderer did not reach the Java listener on 19800 within 10 s'; }
+        sleep 1; n=$((n + 1))
+    done
+    n=0
+    while :; do
+        dm "$DMP-gd-r.txt" gd || :; parse_gd "$DMP-gd-r.txt"
+        if [ -n "$GD98" ]; then break; fi
+        [ "$n" -lt 5 ] || { render_stop; fail 'displayable 98 not registered by the renderer'; }
+        sleep 1; n=$((n + 1))
+    done
+    echo "RENDERER_READY: pid=$(cat "$RPID") d98=$GD98 started=$started"
+    if [ "$Q_DECLARED" = no ]; then
+        dm "$DMP-dc.txt" dc "$CTX" $TEST_LIST || { render_stop; fail "dmdt dc $CTX"; }
+        dm "$DMP-gc-dc.txt" gc || { render_stop; fail 'dmdt gc after dc'; }
+        ctx_declared "$DMP-gc-dc.txt" && [ "$GC_FORMAT" = parsed ] && [ "$GC_LIST" = "$TEST_LIST" ] \
+            || { render_stop; fail "context $CTX not declared as [$TEST_LIST] after dc"; }
+    fi
+    dm "$DMP-gs-armed.txt" gs || :; parse_gs "$DMP-gs-armed.txt"
+    [ "$CL_CTX" != "$CTX" ] || { render_stop; fail 'cluster switched during arm'; }
+    echo "CONTEXT_${CTX}_DECLARED: [$TEST_LIST] cluster_ctx=${CL_CTX:-UNKNOWN}"
+    # The Java presenter switches the cluster through this helper (v2); prove it read-only now.
+    sc_rc=0; /bin/sh "$RENDER_DIR/f5_sc.sh" gs || sc_rc=$?
+    [ "$sc_rc" = "$CL_CTX" ] || { render_stop; fail "context helper read back $sc_rc, expected $CL_CTX (see /tmp/mu1320-f5-sc.log)"; }
+    echo "CONTEXT_HELPER_OK: gs=$sc_rc"
+}
+
+# render_disarm: stop the renderer; if the cluster was left on 80 put it back on 74 (F4 restore
+# path).  Never exits: sets DISARM_CLUSTER_OK=1 only when the renderer is gone and the cluster is
+# confirmed on a context other than 80; the caller decides whether that is fatal.
+render_disarm() {
+    DISARM_CLUSTER_OK=0
+    render_stop
+    dm "$DMP-gs-disarm.txt" gs || :; parse_gs "$DMP-gs-disarm.txt"
+    if [ "$CL_CTX" = "$CTX" ]; then
+        echo "CLUSTER_ON_$CTX: switching to 74"
+        dm "$DMP-sc-disarm.txt" sc "$DISPLAY_ID" 74 || echo 'WARNING: dmdt sc failed'
+        sleep 3
+        dm "$DMP-gs-disarm2.txt" gs || :; parse_gs "$DMP-gs-disarm2.txt"
+    fi
+    if renderer_alive; then echo "WARNING: renderer still running pid=$r_pid"
+    elif [ -z "$CL_CTX" ]; then echo 'WARNING: cluster context UNKNOWN (displaymanager did not answer)'
+    elif [ "$CL_CTX" = "$CTX" ]; then echo "WARNING: cluster still on context $CTX"
+    else DISARM_CLUSTER_OK=1; fi
+    echo "DISARM_CLUSTER_CONTEXT: ${CL_CTX:-UNKNOWN} restored=$DISARM_CLUSTER_OK"
+}

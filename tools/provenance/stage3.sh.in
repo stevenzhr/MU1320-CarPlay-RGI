@@ -1,0 +1,163 @@
+#!/bin/sh
+set -eu
+PATH=/proc/boot:/bin:/usr/bin:/sbin:/usr/sbin:/mnt/app/armle/bin:/mnt/app/armle/usr/bin
+export PATH
+[ "$#" -eq 1 ] || { echo 'usage: stage3.sh status|install|arm|disarm|collect|rollback'; exit 2; }
+action=$1
+case "$action" in status|install|arm|disarm|collect|rollback) ;; *) exit 2 ;; esac
+case "$0" in */*) stage_dir=${0%/*} ;; *) exit 2 ;; esac
+stage_dir=$(CDPATH= cd "$stage_dir" && pwd -P)
+ROOT=/mnt/app/root/mu1320-rgi-stage3-v1
+SYSTEM=/mnt/system/etc/eso/production/smartphone_integrator.json
+ACTIVE=/etc/eso/production/smartphone_integrator.json
+ARM=/tmp/mu1320-stage3.arm
+fail() { echo "STOP: $*" >&2; exit 1; }
+exists() { [ -e "$1" ] || [ -L "$1" ]; }
+for utility in id uname cksum ls cat; do command -v "$utility" >/dev/null 2>&1 || fail "missing $utility"; done
+uid=$(id -u) || fail 'id failed'
+set -f; set -- $uid
+[ "$#" -eq 1 ] && [ "$1" = 0 ] || fail 'effective UID must be 0'
+case "$(uname -a)" in QNX\ *\ 6.5.0\ *\ armle) ;; *) fail 'wrong platform' ;; esac
+check() {
+    [ -f "$3" ] && [ ! -L "$3" ] || return 1
+    check_crc=$1; check_size=$2; check_output=$(cksum "$3") || return 1
+    set -- $check_output
+    [ "${1:-}" = "$check_crc" ] && [ "${2:-}" = "$check_size" ]
+}
+attrs() { value=$(LC_ALL=C ls -ln "$1") || return 1; set -- $value; [ "$#" -ge 5 ] || return 1; printf '%s %s %s\n' "$1" "$3" "$4"; }
+old_ok() { check @SI_OLD_CRC@ @SI_OLD_SIZE@ "$1" && [ "$(attrs "$1")" = '-rw-r--r-- 0 0' ]; }
+new_ok() { check @SI_NEW_CRC@ @SI_NEW_SIZE@ "$1" && [ "$(attrs "$1")" = '-rw-r--r-- 0 0' ]; }
+run_clean() { (for var in LD_PRELOAD LD_DEBUG DL_DEBUG LD_DEBUG_OUTPUT; do unset "$var" || :; done; LD_LIBRARY_PATH=/proc/boot:/lib exec "$@"); }
+check @MOUNT_CRC@ @MOUNT_SIZE@ "$stage_dir/mount_state" || fail 'mount helper checksum'
+check 3727885851 560715 /proc/boot/libc.so.3 || fail 'libc baseline'
+state() { run_clean "$stage_dir/mount_state" "$1"; }
+app_state=$(state /mnt/app) || fail 'app mount query'
+system_state=$(state /mnt/system) || fail 'system mount query'
+case "$app_state:$system_state" in ro:ro|ro:rw|rw:ro|rw:rw) ;; *) fail 'unknown mount states' ;; esac
+if old_ok "$SYSTEM"; then echo 'SYSTEM_CONFIG: BASELINE';
+elif new_ok "$SYSTEM"; then echo 'SYSTEM_CONFIG: STAGE3';
+else fail 'unknown system SI configuration; preserve it'; fi
+if old_ok "$ACTIVE"; then echo 'ACTIVE_CONFIG: BASELINE';
+elif new_ok "$ACTIVE"; then echo 'ACTIVE_CONFIG: STAGE3';
+else fail 'unknown active SI configuration'; fi
+echo "MOUNTS: app=$app_state system=$system_state"
+if [ "$action" = status ] || [ "$action" = collect ]; then
+    if exists "$ARM"; then echo 'TOKEN: PRESENT (does not prove a running hook)'; else echo 'TOKEN: ABSENT (does not prove a stopped hook)'; fi
+    if [ "$action" = collect ]; then
+        for file in /tmp/mu1320-stage3-wrapper.log /tmp/carplay_hook.log; do
+            echo "LOG_BEGIN: $file"
+            if [ -f "$file" ] && [ ! -L "$file" ]; then cat "$file"; else echo 'NO_LOG'; fi
+            echo "LOG_END: $file"
+        done
+        if command -v pidin >/dev/null 2>&1; then pidin ar || :; fi
+    fi
+    echo 'FILE_STATE_ONLY: reboot/config parsing/process lifetime require observation'
+    exit 0
+fi
+for utility in cp mv chmod mkdir sync; do command -v "$utility" >/dev/null 2>&1 || fail "missing $utility"; done
+disarm() {
+    if exists "$ARM"; then
+        check @ARM_CRC@ @ARM_SIZE@ "$ARM" || fail 'unknown arm token'
+        target="/tmp/mu1320-stage3.disarmed.$$"
+        exists "$target" && fail 'token destination collision'
+        mv "$ARM" "$target"
+    fi
+}
+runtime_ok() {
+    [ -d "$ROOT" ] && [ ! -L "$ROOT" ] || fail 'unsafe workspace'
+    check @IDENTITY_CRC@ @IDENTITY_SIZE@ "$ROOT/IDENTITY" || fail 'identity mismatch'
+    @RUNTIME_CHECKS@
+}
+if [ "$action" = disarm ]; then
+    disarm
+    echo 'DISARMED: no future one-shot; running dio is unchanged. Disconnect phone normally.'
+    exit 0
+fi
+if [ "$action" = arm ]; then
+    new_ok "$SYSTEM" && new_ok "$ACTIVE" || fail 'Stage3 SI configuration not visible at BOTH paths after normal reboot; do not arm'
+    runtime_ok
+    exists "$ARM" && fail 'already armed'
+    tmp="/tmp/mu1320-stage3.arm.pending.$$"
+    exists "$tmp" && fail 'token temporary collision'
+    umask 077
+    printf 'MU1320-STAGE3-ONE-SHOT-V1\n' > "$tmp"
+    check @ARM_CRC@ @ARM_SIZE@ "$tmp" || fail 'arm token validation'
+    # Marker enables bounded upstream logging. Do not overwrite an existing marker.
+    if ! exists /tmp/carplay_verbose; then : > /tmp/carplay_verbose; fi
+    mv "$tmp" "$ARM"
+    echo 'ARMED_ONCE: connect the disconnected phone once. No Java/VC/HUD modules enabled.'
+    exit 0
+fi
+command -v mount >/dev/null 2>&1 || fail 'missing mount'
+for directory in /mnt/app/root /mnt/system/etc /mnt/system/etc/eso /mnt/system/etc/eso/production; do
+    [ -d "$directory" ] && [ ! -L "$directory" ] || fail "unsafe directory $directory"
+done
+if [ "$action" = install ]; then
+    exists "$ROOT" && fail 'workspace exists; preserve it'
+    old_ok "$SYSTEM" && old_ok "$ACTIVE" || fail 'SI baseline required'
+    check 2960431692 2645 /mnt/app/eso/hmi/lsd/jars/NavActiveIgnore.jar || fail 'Stage2 must be rolled back'
+    exists /mnt/app/eso/hmi/lsd/jars/CarPlayRGI-MU1320-Stage2.jar && fail 'Stage2 still installed'
+    check 3919119664 15734 /etc/eso/production/dio_manager.json || fail 'active dio config differs'
+    check 3919119664 15734 /mnt/system/etc/eso/production/dio_manager.json || fail 'system dio config differs'
+    @PAYLOAD_CHECKS@
+else
+    disarm
+    if old_ok "$SYSTEM"; then echo 'ROLLBACK_ALREADY_BASELINE: reboot normally if SI used Stage3'; exit 0; fi
+    [ -d "$ROOT/backup" ] && [ ! -L "$ROOT" ] && [ ! -L "$ROOT/backup" ] || fail 'unsafe backup directory'
+    check @IDENTITY_CRC@ @IDENTITY_SIZE@ "$ROOT/IDENTITY" || fail 'identity mismatch'
+    old_ok "$ROOT/backup/smartphone_integrator.json" || fail 'rollback backup changed'
+fi
+restore_app=0; restore_system=0; completed=0
+cleanup() {
+    result=$?; trap - 0 1 2 15; set +e
+    sync || result=1
+    if [ "$restore_system" = 1 ]; then mount -ur /mnt/system || result=1; fi
+    if [ "$restore_app" = 1 ]; then mount -ur /mnt/app || result=1; fi
+    final_app=$(state /mnt/app); app_query=$?
+    final_system=$(state /mnt/system); system_query=$?
+    if [ "$app_query" != 0 ] || [ "$system_query" != 0 ] || [ "$final_app:$final_system" != "$app_state:$system_state" ]; then
+        echo 'STOP: original mounts not restored; preserve output and check mounts' >&2; result=1
+    else echo "MOUNTS_RESTORED: app=$final_app system=$final_system"; fi
+    if [ "$result" = 0 ] && [ "$completed" = 1 ]; then echo "STAGE3_${action}_FILES_PASSED: no restart performed";
+    elif [ "$action" = install ]; then echo 'INSTALL_INCOMPLETE: run rollback before any planned reboot' >&2; fi
+    exit "$result"
+}
+trap cleanup 0
+trap 'exit 129' 1
+trap 'exit 130' 2
+trap 'exit 143' 15
+if [ "$action" = install ]; then
+    if [ "$app_state" = ro ]; then restore_app=1; mount -uw /mnt/app; fi
+    [ "$(state /mnt/app)" = rw ] || fail 'app not writable'
+    umask 077
+    mkdir "$ROOT" "$ROOT/backup" "$ROOT/config"
+    cp "$stage_dir/IDENTITY" "$ROOT/IDENTITY"
+    cp -p "$SYSTEM" "$ROOT/backup/smartphone_integrator.json"
+    old_ok "$ROOT/backup/smartphone_integrator.json" || fail 'backup validation'
+    cp "$stage_dir/libcarplay_hook.so" "$ROOT/libcarplay_hook.so"
+    cp "$stage_dir/carplay_startup.sh" "$ROOT/carplay_startup.sh"
+    cp "$stage_dir/dio_manager.json" "$ROOT/config/dio_manager.json"
+    chmod 755 "$ROOT/carplay_startup.sh"
+    chmod 644 "$ROOT/libcarplay_hook.so" "$ROOT/config/dio_manager.json"
+    runtime_ok
+    sync
+    source="$stage_dir/smartphone_integrator.json"
+else
+    source="$ROOT/backup/smartphone_integrator.json"
+fi
+# Only the persistent system SI file is replaced. /etc propagation is checked
+# after a normal boot, never assumed from equal original file contents.
+if [ "$system_state" = ro ]; then restore_system=1; mount -uw /mnt/system; fi
+[ "$(state /mnt/system)" = rw ] || fail 'system not writable'
+pending="/mnt/system/etc/eso/production/.mu1320-stage3-$action.$$"
+exists "$pending" && fail 'system temporary collision'
+if [ "$action" = rollback ]; then cp -p "$source" "$pending"; else cp "$source" "$pending"; fi
+chmod 644 "$pending"
+if [ "$action" = install ]; then new_ok "$pending" || fail 'pending SI validation';
+else old_ok "$pending" || fail 'pending restore validation'; fi
+sync
+mv "$pending" "$SYSTEM"
+if [ "$action" = install ]; then new_ok "$SYSTEM" || fail 'installed SI validation';
+else old_ok "$SYSTEM" || fail 'restored SI validation'; fi
+sync
+completed=1

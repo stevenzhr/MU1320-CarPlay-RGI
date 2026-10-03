@@ -1,0 +1,45 @@
+# MU1320 F5 cluster context helper, run by the F5 Java ClusterPresenter via
+# Runtime.exec (as stock lsd runs commands) from the runtime workspace:
+#   /bin/sh @RUNTIME@/render/f5_sc.sh <ctx>   dmdt sc 4 <ctx>, then read the cluster back
+#   /bin/sh @RUNTIME@/render/f5_sc.sh gs      read the cluster context only
+# Exit status: the cluster context read back (0-199), 250 unknown (no answer),
+# 251 dmdt timeout, 252 usage/setup failure.
+# Why native: stock DisplayManagerMIB2High rewrites a Java switchContext(80)
+# to 73 while the KDK is visible (F5 v1 car run, reports/F5-V1-CTX-CALLERS.md);
+# dmdt sc is the F4 car path.  Never "dmdt ts" (F4 run2 hung displaymanager).
+exec < /dev/null >> /tmp/mu1320-f5-sc.log 2>&1
+# Started from the HMI JVM: its PATH is unknown, and dm()'s watchdog needs sleep/kill.
+PATH=/proc/boot:/bin:/usr/bin:/sbin:/usr/sbin:$PATH; export PATH
+RENDER=@RUNTIME@/render
+UNBUF=$RENDER/f4_unbuf.so
+DMP=/tmp/mu1320-f5-dm-sc
+fail() { echo "SC_FAIL $*"; exit 252; }
+exists() { [ -e "$1" ] || [ -L "$1" ]; }
+arg=${1:-}
+case "$arg" in
+    gs) ;;
+    ''|*[!0-9]*) fail "usage: $arg" ;;
+    *) [ "$arg" -le 199 ] || fail "context out of range: $arg" ;;
+esac
+[ -f "$RENDER/f5_dm.sh" ] && [ -f "$UNBUF" ] || fail 'runtime helper files missing'
+. "$RENDER/f5_dm.sh"
+rc=0
+if [ "$arg" != gs ]; then
+    dm "$DMP-sc.txt" sc "$DISPLAY_ID" "$arg" || rc=$?
+    if [ "$rc" = 124 ]; then echo "SC ctx=$arg DMDT_TIMEOUT"; exit 251; fi
+fi
+# Re-read (one second apart, three reads at most) only when displaymanager gave no
+# context: a definite other context means stock took the cluster back meanwhile, and
+# waiting cost 2 s per VIEW press in the F5 v4 car run.
+n=0
+while :; do
+    grc=0; dm "$DMP-gs.txt" gs || grc=$?
+    if [ "$grc" = 124 ]; then echo "SC ctx=$arg rc=$rc GS_TIMEOUT"; exit 251; fi
+    parse_gs "$DMP-gs.txt"
+    if [ -n "$CL_CTX" ] || [ "$n" -ge 2 ]; then break; fi
+    sleep 1; n=$((n + 1))
+done
+echo "SC ctx=$arg rc=$rc reads=$((n + 1)) cluster=${CL_CTX:-UNKNOWN} list=[$CL_LIST]"
+case "$CL_CTX" in ''|*[!0-9]*) exit 250 ;; esac
+[ "$CL_CTX" -le 199 ] || exit 250
+exit "$CL_CTX"

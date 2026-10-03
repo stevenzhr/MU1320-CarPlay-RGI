@@ -1,0 +1,25 @@
+#!/bin/sh
+# SI owns this exact PID; no monitor, renderer, Java change or process killing.
+ROOT=/mnt/app/root/mu1320-rgi-stage3-v1
+ARM=/tmp/mu1320-stage3.arm
+PATH=${PATH:-/proc/boot:/bin:/usr/bin}:/proc/boot:/bin:/usr/bin
+export PATH
+valid() {
+    [ -f "$3" ] && [ ! -L "$3" ] || return 1
+    output=$(cksum "$3") || return 1
+    want_crc=$1; want_size=$2
+    set -f; set -- $output
+    [ "${1:-}" = "$want_crc" ] && [ "${2:-}" = "$want_size" ]
+}
+cd /mnt/app/eso/bin/apps || exit 127
+# A consumed token cannot arm a supervisor retry. Missing/bad files use stock.
+if valid @ARM_CRC@ @ARM_SIZE@ "$ARM" &&
+   valid @HOOK_CRC@ @HOOK_SIZE@ "$ROOT/libcarplay_hook.so" &&
+   valid @DIO_CRC@ @DIO_SIZE@ "$ROOT/config/dio_manager.json" &&
+   [ ! -e "/tmp/mu1320-stage3.claimed.$$" ] &&
+   mv "$ARM" "/tmp/mu1320-stage3.claimed.$$"; then
+    printf 'STAGE3_HOOK_ONCE pid=%s\n' "$$" >> /tmp/mu1320-stage3-wrapper.log
+    LD_PRELOAD="$ROOT/libcarplay_hook.so" IPL_CONFIG_DIR_DIO_MANAGER="$ROOT/config" exec /mnt/app/eso/bin/apps/dio_manager "$@"
+fi
+printf 'STAGE3_STOCK pid=%s\n' "$$" >> /tmp/mu1320-stage3-wrapper.log
+exec /mnt/app/eso/bin/apps/dio_manager "$@"

@@ -1,0 +1,489 @@
+#!/bin/sh
+# MU1320 F4 renderer trial (native-only, runtime-only).
+# Writes nothing under /mnt/app or /mnt/system.  The only vehicle state it
+# changes is DisplayManager memory: one declared context (@CTX@) and, while
+# the run lasts, the cluster context.  A normal reboot clears both.
+# Never call "dmdt ts": on this unit it hung displaymanager and the MMI rebooted (v1 run2).
+set -eu
+for var in LD_PRELOAD LD_DEBUG DL_DEBUG LD_DEBUG_OUTPUT; do unset "$var" || :; done
+PATH=/proc/boot:/bin:/usr/bin:/sbin:/usr/sbin:/mnt/app/armle/bin:/mnt/app/armle/usr/bin
+export PATH
+[ "$#" -ge 1 ] || exit 2
+action=$1; phase=${2:-}
+case "$action:$#" in status:1|run:1|restore:1|collect:2) ;; *) exit 2 ;; esac
+case "$action:$phase" in collect:before|collect:after|collect:restored|collect:snapshot|status:|run:|restore:) ;; *) exit 2 ;; esac
+case "$0" in */*) stage_dir=${0%/*} ;; *) exit 2 ;; esac
+stage_dir=$(CDPATH= cd "$stage_dir" && pwd -P)
+
+DMDT=/mnt/app/eso/bin/apps/dmdt
+# dmdt addresses displaymanager's INTERNAL display ids.  Stock DisplayManager.getInternalDisplayID
+# maps external 0/3 -> 0 (main), 2/4 -> 1, external 1 (cluster) -> 4.  v1 run3 used 1: silently ignored.
+DISPLAY_ID=4
+MAIN_ID=0
+CTX=@CTX@
+TEST_LIST='98 102 101 33'
+PREFIX=/tmp/mu1320-f4-v1
+BASEFILE=$PREFIX.base
+MAINFILE=$PREFIX.main
+PIDFILE=$PREFIX.renderer.pid
+FEEDPIDFILE=$PREFIX.feed.pid
+RENDER_LD=/proc/boot:/lib
+REXIT=$PREFIX.renderer.exit
+FEXIT=$PREFIX.feed.exit
+HOLD=@HOLD@
+SETTLE=@SETTLE@
+FEED_MARGIN=10
+
+LIVE=${F4_LIVE_FD3:-0}
+DM_STRICT=0
+fail() { echo "STOP: $*" >&2; if [ "$LIVE" = 1 ]; then echo "STOP: $*" >&3 || :; fi; exit 1; }
+exists() { [ -e "$1" ] || [ -L "$1" ]; }
+live() { echo "$*"; if [ "$LIVE" = 1 ]; then echo "$*" >&3 || :; fi; }
+for utility in id uname cksum cat grep cp mkdir rm sleep date; do command -v "$utility" >/dev/null 2>&1 || fail "missing $utility"; done
+uid=$(id -u); set -f; set -- $uid
+[ "$#" = 1 ] && [ "$1" = 0 ] || fail 'effective UID must be 0'
+case "$(uname -a)" in QNX\ *\ 6.5.0\ *\ armle) ;; *) fail 'wrong platform' ;; esac
+check() { [ -f "$3" ] && [ ! -L "$3" ] || return 1; c=$1; n=$2; output=$(cksum "$3") || return 1; set -- $output; [ "${1:-}" = "$c" ] && [ "${2:-}" = "$n" ]; }
+check @RENDER_SUM@ "$stage_dir/maneuver_render" || fail 'renderer checksum'
+check @FEED_SUM@ "$stage_dir/f4_feed" || fail 'feeder checksum'
+check @ATLAS_SUM@ "$stage_dir/flag_atlas.rgba" || fail 'flag atlas checksum'
+check @UNBUF_SUM@ "$stage_dir/f4_unbuf.so" || fail 'dmdt stdout shim checksum'
+check 2992755173 34464 "$DMDT" || fail 'dmdt baseline'
+check 3727885851 560715 /proc/boot/libc.so.3 || fail 'libc baseline'
+check 3860773368 159537 /proc/boot/libm.so.2 || fail 'libm baseline'
+check 863911487 179441 /lib/libsocket.so.3 || fail 'libsocket baseline'
+check 243647934 108208 /proc/boot/libscreen.so.1 || fail 'libscreen baseline'
+check 410392744 60537 /proc/boot/libEGL.so.1 || fail 'libEGL baseline'
+check 2368836050 86274 /proc/boot/libGLESv2.so.1 || fail 'libGLESv2 baseline'
+set +f
+
+# dm OUT ARGS...: run dmdt with a 10 s watchdog; output (and any timeout) in OUT.
+# dmdt leaves via _Exit() without flushing stdio, so redirected output loses its last
+# partial buffer (v1 on the car: gs/gd empty, gc cut at 10240 bytes).  f4_unbuf.so makes
+# its stdout unbuffered.  The child is reaped by wait (kill -0 sees unreaped zombies).
+dm() {
+    dm_out=$1; shift
+    (for var in LD_PRELOAD LD_DEBUG DL_DEBUG LD_DEBUG_OUTPUT; do unset "$var" || :; done
+     LD_PRELOAD=$stage_dir/f4_unbuf.so LD_LIBRARY_PATH=/proc/boot:/lib exec "$DMDT" "$@" > "$dm_out" 2>&1) &
+    dm_pid=$!
+    (sleep 10; kill -9 "$dm_pid" 2>/dev/null) &
+    dm_wd=$!
+    dm_rc=0; wait "$dm_pid" || dm_rc=$?
+    kill "$dm_wd" 2>/dev/null || :; wait "$dm_wd" 2>/dev/null || :
+    if [ "$dm_rc" = 137 ]; then
+        echo "DMDT_TIMEOUT $*" >> "$dm_out"
+        # During run a silent displaymanager is a stop condition, never something to work around.
+        if [ "$DM_STRICT" = 1 ]; then fail "displaymanager did not answer dmdt $1 within 10 s"; fi
+        return 124
+    fi
+    return "$dm_rc"
+}
+
+# parse_gs FILE -> CL_CTX, CL_LIST (cluster = terminal LVDS2)
+# Every parser also reads a last line that has no trailing newline.
+parse_gs() {
+    CL_CTX=''; CL_LIST=''; MAIN_CTX=''; gs_in=0; gs_main=0
+    while read -r gs_a gs_b gs_c gs_rest || [ -n "$gs_a" ]; do
+        if [ "$gs_a $gs_b" = 'terminal: LVDS1' ]; then gs_main=1; continue; fi
+        if [ "$gs_main" = 1 ] && [ "$gs_a $gs_b" = 'context id:' ]; then MAIN_CTX=$gs_c; gs_main=2; continue; fi
+        if [ "$gs_a $gs_b" = 'terminal: LVDS2' ]; then gs_in=1; continue; fi
+        if [ "$gs_in" = 1 ] && [ "$gs_a $gs_b" = 'context id:' ]; then CL_CTX=$gs_c; gs_in=2; continue; fi
+        if [ "$gs_in" = 2 ]; then
+            case "$gs_a" in ''|*[!0-9]*) gs_in=3; continue ;; esac
+            case "$gs_b" in '('*) CL_LIST="${CL_LIST:+$CL_LIST }$gs_a" ;; *) gs_in=3 ;; esac
+        fi
+    done < "$1"
+}
+
+# parse_gd FILE -> GD_IDS, GD98 ("type WxH" or empty), GD_COMPLETE (rows == "knows N")
+parse_gd() {
+    GD_IDS=''; GD98=''; gd_n=''; gd_rows=0
+    while read -r gd_id gd_type gd_w gd_x gd_h gd_rest || [ -n "$gd_id" ]; do
+        if [ "$gd_id $gd_type $gd_x" = 'displaymanager knows displayables:' ]; then gd_n=$gd_w; continue; fi
+        case "$gd_id" in ''|*[!0-9-]*) continue ;; esac
+        [ "$gd_x" = x ] || continue
+        GD_IDS="${GD_IDS:+$GD_IDS }$gd_id"; gd_rows=$((gd_rows + 1))
+        if [ "$gd_id" = 98 ]; then GD98="$gd_type ${gd_w}x$gd_h"; fi
+    done < "$1"
+    GD_COMPLETE=no
+    if [ -n "$gd_n" ] && [ "$gd_n" = "$gd_rows" ]; then GD_COMPLETE=yes; fi
+    GD_COUNT="$gd_rows/${gd_n:-?}"
+}
+
+# parse_gc FILE -> GC_FORMAT (parsed|raw|incomplete), GC_IDS, GC_LIST (displayables of $CTX),
+# GC_STOCK (of 74).  "parsed" also requires the context count to match "knows N contexts".
+parse_gc() {
+    GC_IDS=''; GC_LIST=''; GC_STOCK=''; gc_cur=''; gc_n=''; gc_rows=0
+    while read -r gc_a gc_b gc_rest || [ -n "$gc_a" ]; do
+        if [ "$gc_a $gc_b" = 'displaymanager knows' ]; then gc_n=${gc_rest%% *}; continue; fi
+        case "$gc_a" in ''|*[!0-9-]*) continue ;; esac
+        if [ "$gc_b" = '|' ]; then gc_cur=$gc_a; GC_IDS="${GC_IDS:+$GC_IDS }$gc_a"; gc_rows=$((gc_rows + 1)); continue; fi
+        case "$gc_b" in
+            '('*)
+                if [ "$gc_cur" = "$CTX" ]; then GC_LIST="${GC_LIST:+$GC_LIST }$gc_a"; fi
+                if [ "$gc_cur" = 74 ]; then GC_STOCK="${GC_STOCK:+$GC_STOCK }$gc_a"; fi ;;
+        esac
+    done < "$1"
+    GC_FORMAT=raw
+    for gc_id in $GC_IDS; do if [ "$gc_id" = 74 ]; then GC_FORMAT=parsed; fi; done
+    if [ "$GC_FORMAT" = parsed ] && [ "$gc_n" != "$gc_rows" ]; then GC_FORMAT=incomplete; fi
+    GC_COUNT="$gc_rows/${gc_n:-?}"
+}
+
+# ctx_declared FILE: 0 if $CTX appears as a context (parsed) or as any line's first field (raw)
+ctx_declared() {
+    parse_gc "$1"
+    if [ "$GC_FORMAT" = parsed ]; then
+        for gc_id in $GC_IDS; do if [ "$gc_id" = "$CTX" ]; then return 0; fi; done
+        return 1
+    fi
+    while read -r gc_a gc_rest || [ -n "$gc_a" ]; do if [ "$gc_a" = "$CTX" ]; then return 0; fi; done < "$1"
+    return 1
+}
+
+query() {
+    q_dir=$1; [ -d "$q_dir" ] || mkdir "$q_dir"
+    dm "$q_dir/gs.txt" gs || :; dm "$q_dir/gd.txt" gd || :; dm "$q_dir/gc.txt" gc || :
+    parse_gs "$q_dir/gs.txt"; parse_gd "$q_dir/gd.txt"
+    if ctx_declared "$q_dir/gc.txt"; then Q_DECLARED=yes; else Q_DECLARED=no; fi
+    echo "DM_CLUSTER_CONTEXT: ${CL_CTX:-UNKNOWN} list=[${CL_LIST}] main=${MAIN_CTX:-UNKNOWN}"
+    echo "DM_DISPLAYABLES: [${GD_IDS}] d98=${GD98:-ABSENT} complete=$GD_COMPLETE ($GD_COUNT)"
+    echo "DM_CONTEXT_$CTX: $( [ "$Q_DECLARED" = yes ] && echo DECLARED || echo ABSENT ) gc_format=$GC_FORMAT ($GC_COUNT) stock74=[${GC_STOCK}]"
+}
+
+renderer_alive() {
+    [ -f "$PIDFILE" ] || return 1
+    r_pid=$(cat "$PIDFILE") || return 1
+    case "$r_pid" in ''|*[!0-9]*) return 1 ;; esac
+    kill -0 "$r_pid" 2>/dev/null || return 1
+    pidin -p "$r_pid" -F '%256n' 2>/dev/null | grep maneuver_render >/dev/null 2>&1
+}
+
+# restore_runtime DIR [switch|keep]: stop our processes; with "switch" (default) put the
+# cluster back on the recorded stock context (74 when unknown) only while it is on ours.
+restore_runtime() {
+    set +e
+    b_ctx=74; b_list=''
+    if [ -f "$BASEFILE" ]; then read -r b_ctx b_list < "$BASEFILE"; fi
+    case "$b_ctx" in ''|*[!0-9]*|"$CTX") b_ctx=74; b_list='' ;; esac
+    if [ -f "$FEEDPIDFILE" ]; then
+        f_pid=$(cat "$FEEDPIDFILE"); case "$f_pid" in ''|*[!0-9]*) ;; *) kill -9 "$f_pid" 2>/dev/null ;; esac
+        rm -f "$FEEDPIDFILE"
+    fi
+    if renderer_alive; then
+        echo "RESTORE: stopping renderer pid=$r_pid"
+        kill -TERM "$r_pid" 2>/dev/null; n=0
+        while kill -0 "$r_pid" 2>/dev/null && [ "$n" -lt 5 ]; do sleep 1; n=$((n + 1)); done
+        if kill -0 "$r_pid" 2>/dev/null; then kill -9 "$r_pid" 2>/dev/null; sleep 1; fi
+    fi
+    rm -f "$PIDFILE" "$REXIT" "$FEXIT"
+    r_dir=$1; r_policy=${2:-switch}
+    [ -d "$r_dir" ] || mkdir "$r_dir"
+    dm "$r_dir/gs.txt" gs; parse_gs "$r_dir/gs.txt"
+    if [ "$CL_CTX" = "$CTX" ] && [ "$r_policy" = switch ]; then
+        echo "RESTORE: cluster on context $CTX -> switching to $b_ctx"
+        dm "$r_dir/sc.txt" sc "$DISPLAY_ID" "$b_ctx"; sleep "$SETTLE"
+        dm "$r_dir/gs-after.txt" gs; parse_gs "$r_dir/gs-after.txt"
+    fi
+    # main display last, so a cluster switch cannot undo it
+    m_ctx=''
+    if [ -f "$MAINFILE" ]; then read -r m_ctx < "$MAINFILE"; fi
+    case "$m_ctx" in ''|*[!0-9]*) m_ctx='' ;; esac
+    if [ -n "$m_ctx" ] && [ -n "$MAIN_CTX" ] && [ "$MAIN_CTX" != "$m_ctx" ] && [ "$r_policy" = switch ]; then
+        echo "RESTORE: main display on context $MAIN_CTX -> switching back to $m_ctx"
+        dm "$r_dir/sc-main.txt" sc "$MAIN_ID" "$m_ctx"; sleep "$SETTLE"
+        dm "$r_dir/gs-main.txt" gs; parse_gs "$r_dir/gs-main.txt"
+    fi
+    dm "$r_dir/gd.txt" gd; parse_gd "$r_dir/gd.txt"
+    live "RESTORE_CLUSTER_CONTEXT: ${CL_CTX:-UNKNOWN} list=[${CL_LIST}]"
+    live "RESTORE_D98: ${GD98:-ABSENT}"
+    if [ "$CL_CTX" = "$b_ctx" ] && [ -z "$GD98" ]; then
+        if { [ -z "$b_list" ] || [ "$CL_LIST" = "$b_list" ]; } && { [ -z "$m_ctx" ] || [ "$MAIN_CTX" = "$m_ctx" ]; }; then
+            rm -f "$BASEFILE" "$MAINFILE"
+            live "RESTORE_RESULT: STOCK_CLUSTER context=$b_ctx main=${MAIN_CTX:-UNKNOWN}"
+            return 0
+        fi
+    fi
+    if [ "$r_policy" = keep ] && [ -z "$GD98" ]; then
+        live "RESTORE_RESULT: UNCHANGED context=${CL_CTX:-UNKNOWN} (this run did not switch the cluster)"
+        return 0
+    fi
+    live 'RESTORE_RESULT: NOT_STOCK (see README: normal reboot restores DisplayManager)'
+    return 1
+}
+
+# /tmp on this unit cannot hold directories: every evidence directory lives on the SD.
+out="$stage_dir/out"; [ -d "$out" ] && [ ! -L "$out" ] || fail 'SD out directory missing (use f4_trial.sh)'
+
+if [ "$action" = status ]; then
+    st_dir="$out/status-$$"
+    query "$st_dir"
+    if renderer_alive; then echo "F4_RENDERER: RUNNING pid=$r_pid"; else echo 'F4_RENDERER: ABSENT'; fi
+    echo 'STATUS_RAW_GS:'; cat "$st_dir/gs.txt"; echo 'STATUS_RAW_GC:'; cat "$st_dir/gc.txt"; echo 'STATUS_RAW_GD:'; cat "$st_dir/gd.txt"
+    echo 'RUNTIME_STATE_ONLY: nothing is installed by F4'
+    exit 0
+fi
+
+if [ "$action" = restore ]; then
+    restore_runtime "$out/restore-$$"
+    exit $?
+fi
+
+if [ "$action" = collect ]; then
+    co_dir="$out/collect-$phase-$$"; mkdir "$co_dir"
+    date > "$co_dir/date.txt" 2>&1 || :
+    query "$co_dir/dm"
+    if renderer_alive; then echo "F4_RENDERER: RUNNING pid=$r_pid"; else echo 'F4_RENDERER: ABSENT'; fi
+    pidin -F '%a %e %256n' > "$co_dir/processes.txt" 2>&1 || :
+    sloginfo > "$co_dir/sloginfo.txt" 2>&1 || echo 'sloginfo unavailable' > "$co_dir/sloginfo.txt"
+    echo "COLLECT_DIR: $co_dir"
+    if [ "$phase" = restored ]; then
+        if [ -n "$CL_CTX" ] && [ "$CL_CTX" != "$CTX" ] && [ -z "$GD98" ] && [ "$Q_DECLARED" = no ]; then
+            echo 'F4_RESTORED_BASELINE: PASS'
+        else
+            echo 'F4_RESTORED_BASELINE: FAIL'
+        fi
+    fi
+    exit 0
+fi
+
+# ---------------------------------------------------------------- run
+RUN="$out/run-$$"; mkdir "$RUN"
+cp "$stage_dir/flag_atlas.rgba" "$RUN/flag_atlas.rgba"
+SWITCHED=0; RPID=''; RMON=''; FMON=''; RN=0; FN=0; SN=0; REVERSIONS=0; PHOTOS=0
+cleanup_run() {
+    run_rc=$?; trap - 0 1 2 15; set +e; DM_STRICT=0
+    if [ "$run_rc" != 0 ]; then live "RUN_ABORTED rc=$run_rc: restoring"; fi
+    if [ "$SWITCHED" = 1 ]; then restore_runtime "$RUN/zz-restore" switch; else restore_runtime "$RUN/zz-restore" keep; fi
+    restore_rc=$?
+    sloginfo > "$RUN/sloginfo.txt" 2>&1 || echo 'sloginfo unavailable' > "$RUN/sloginfo.txt"
+    echo "RUN_DIR: $RUN"
+    echo "STOCK_CONTEXT_REVERSIONS: $REVERSIONS"
+    echo "PHOTO_PROMPTS: $PHOTOS"
+    if [ "$run_rc" = 0 ] && [ "$restore_rc" != 0 ]; then run_rc=1; fi
+    if [ "$run_rc" = 0 ]; then live 'F4_RUN_COMPLETE'; fi
+    exit "$run_rc"
+}
+trap cleanup_run 0; trap 'exit 129' 1; trap 'exit 130' 2; trap 'exit 143' 15
+
+photo() {
+    PHOTOS=$((PHOTOS + 1))
+    live "PHOTO $PHOTOS [$1] $2 -- photograph the VC now (${HOLD}s)"
+}
+
+snap() {
+    SN=$((SN + 1)); s_dir="$RUN/s$SN-$1"; mkdir "$s_dir"
+    date > "$s_dir/date.txt" 2>&1 || :
+    dm "$s_dir/gs.txt" gs || :; dm "$s_dir/gd.txt" gd || :
+    parse_gs "$s_dir/gs.txt"; parse_gd "$s_dir/gd.txt"
+    [ -n "$CL_CTX" ] && [ "$GD_COMPLETE" = yes ] || fail "displaymanager query failed at s$SN-$1 (ctx=${CL_CTX:-UNKNOWN} gd=$GD_COUNT)"
+    live "SNAP s$SN-$1 cluster_ctx=${CL_CTX:-UNKNOWN} list=[${CL_LIST}] d98=${GD98:-ABSENT}"
+}
+
+# expect_ours: the cluster must still be on $CTX; a stock writer may take it back.
+expect_ours() {
+    if [ "$CL_CTX" = "$CTX" ] && [ "$CL_LIST" = "$TEST_LIST" ]; then return 0; fi
+    REVERSIONS=$((REVERSIONS + 1))
+    live "STOCK_CONTEXT_CHANGE step=$1 ctx=${CL_CTX:-UNKNOWN} list=[${CL_LIST}] count=$REVERSIONS"
+    [ "$REVERSIONS" -le 3 ] || fail 'stock HMI keeps switching the cluster away; stopping'
+    switch_to "$CTX" "$TEST_LIST" "reassert-$1"
+}
+
+switch_to() {
+    sw_dir="$RUN/sc-$3"; mkdir "$sw_dir"
+    SWITCHED=1
+    dm "$sw_dir/sc.txt" sc "$DISPLAY_ID" "$1" || fail "dmdt sc $DISPLAY_ID $1"
+    sleep "$SETTLE"
+    dm "$sw_dir/gs.txt" gs || fail 'dmdt gs after switch'
+    parse_gs "$sw_dir/gs.txt"
+    [ "$MAIN_CTX" = "$BASE_MAIN" ] || fail "main display context changed to ${MAIN_CTX:-UNKNOWN} (was $BASE_MAIN) after sc $DISPLAY_ID $1"
+    [ "$CL_CTX" = "$1" ] && [ "$CL_LIST" = "$2" ] || fail "cluster did not switch to $1 (ctx=${CL_CTX:-UNKNOWN} list=[$CL_LIST])"
+    echo "SWITCHED_TO: $1 list=[$CL_LIST]"
+}
+
+# Renderer and feeder run under a monitor subshell that reaps them and writes their exit
+# code, so "has it exited" is a file test rather than kill -0 on a possible zombie.
+render_start() {
+    RN=$((RN + 1)); RLOG="$RUN/renderer-$RN.log"
+    rm -f "$PIDFILE" "$REXIT"
+    ( (cd "$RUN" || exit 1
+      for var in LD_PRELOAD LD_DEBUG DL_DEBUG LD_DEBUG_OUTPUT; do unset "$var" || :; done
+      LD_LIBRARY_PATH=$RENDER_LD GRAPHICS_ROOT=/proc/boot exec "$stage_dir/maneuver_render" < /dev/null > "$RLOG" 2>&1) &
+     echo "$!" > "$PIDFILE"
+     m_rc=0; wait "$!" || m_rc=$?
+     echo "$m_rc" > "$REXIT") &
+    RMON=$!
+    n=0
+    while [ ! -s "$PIDFILE" ]; do [ "$n" -lt 10 ] || fail 'renderer monitor did not start'; sleep 1; n=$((n + 1)); done
+    RPID=$(cat "$PIDFILE")
+    n=0
+    while ! grep 'maneuver_render: ready' "$RLOG" >/dev/null 2>&1; do
+        if [ -f "$REXIT" ]; then fail "renderer $RN exited during init rc=$(cat "$REXIT") (see $RLOG)"; fi
+        [ "$n" -lt 25 ] || fail "renderer $RN not ready after 25 s"
+        sleep 1; n=$((n + 1))
+    done
+    n=0
+    while :; do
+        dm "$RUN/gd-r$RN.txt" gd || :; parse_gd "$RUN/gd-r$RN.txt"
+        if [ -n "$GD98" ]; then break; fi
+        [ "$n" -lt 5 ] || fail "displayable 98 not registered by renderer $RN"
+        sleep 1; n=$((n + 1))
+    done
+    live "RENDERER_$RN: pid=$RPID ready d98=$GD98"
+    case "$GD98" in *' 328x181') ;; *) echo "WARN: displayable 98 geometry is $GD98 (expected 328x181)" ;; esac
+}
+
+render_wait_exit() {
+    n=0
+    while [ ! -f "$REXIT" ]; do
+        if [ "$n" -ge "$1" ]; then kill -9 "$RPID" 2>/dev/null || :; fail "renderer $RN still running after $1 s"; fi
+        sleep 1; n=$((n + 1))
+    done
+    wait "$RMON" 2>/dev/null || :
+    r_rc=$(cat "$REXIT"); rm -f "$PIDFILE" "$REXIT"; RPID=''
+    echo "RENDERER_${RN}_EXIT: $r_rc after ${n}s"
+}
+
+feed_start() {
+    FN=$((FN + 1)); FLOG="$RUN/feed-$FN-$2.txt"
+    rm -f "$FEEDPIDFILE" "$FEXIT"
+    ( (for var in LD_PRELOAD LD_DEBUG DL_DEBUG LD_DEBUG_OUTPUT; do unset "$var" || :; done
+      LD_LIBRARY_PATH=/proc/boot:/lib exec "$stage_dir/f4_feed" "$@" > "$FLOG" 2>&1) &
+     echo "$!" > "$FEEDPIDFILE"
+     m_rc=0; wait "$!" || m_rc=$?
+     echo "$m_rc" > "$FEXIT") &
+    FMON=$!
+    n=0
+    while [ ! -s "$FEEDPIDFILE" ]; do [ "$n" -lt 10 ] || fail 'feeder monitor did not start'; sleep 1; n=$((n + 1)); done
+}
+
+feed_wait() {
+    n=0
+    while ! grep "$1" "$FLOG" >/dev/null 2>&1; do
+        if [ -f "$FEXIT" ]; then
+            if grep "$1" "$FLOG" >/dev/null 2>&1; then return 0; fi
+            fail "feeder $FN ended before $1 rc=$(cat "$FEXIT") (see $FLOG)"
+        fi
+        [ "$n" -lt "$2" ] || fail "feeder $FN: no $1 after $2 s"
+        sleep 1; n=$((n + 1))
+    done
+}
+
+# The feeder bounds itself (accept 20 s, READY 20 s, hold <= 120 s), so waiting is finite.
+feed_finish() {
+    wait "$FMON" 2>/dev/null || :
+    f_rc=$(cat "$FEXIT" 2>/dev/null || echo 255)
+    rm -f "$FEEDPIDFILE" "$FEXIT"
+    result=$(grep F4FEED_RESULT "$FLOG" || echo 'F4FEED_RESULT missing')
+    echo "FEED_$FN: exit=$f_rc $result"
+    [ "$f_rc" = 0 ] || fail "feeder $FN failed rc=$f_rc"
+}
+
+# scene NAME DESC ARGS...: show one scene while the cluster is on $CTX.
+scene() {
+    s_name=$1; s_desc=$2; shift 2
+    feed_start "$((HOLD + SETTLE + FEED_MARGIN))" "$@"
+    feed_wait EVT_FRAME_READY 10
+    sleep "$SETTLE"
+    snap "$s_name"; expect_ours "$s_name"
+    photo "$s_name" "$s_desc"
+    feed_finish
+}
+
+live "F4_RUN_BEGIN run_dir=$RUN hold=${HOLD}s"
+DM_STRICT=1
+uname -a
+date || :
+
+# P: preflight - nothing is changed before these pass.
+query "$RUN/p0-before"
+[ "$GD_COMPLETE" = yes ] || fail "dmdt gd output incomplete ($GD_COUNT)"
+[ "$GC_FORMAT" = parsed ] || fail "dmdt gc output $GC_FORMAT ($GC_COUNT)"
+[ -n "$CL_CTX" ] || fail 'cluster context is UNKNOWN (dmdt gs gave no LVDS2 context)'
+[ "$CL_CTX" != "$CTX" ] || fail "cluster is already on context $CTX; run restore, then reboot"
+case " $CL_LIST " in *' 33 '*) ;; *) fail "cluster context $CL_CTX [$CL_LIST] has no map (33): select a VC map view" ;; esac
+for want in 16 33 101 102; do
+    case " $GD_IDS " in *" $want "*) ;; *) fail "unrecognised dmdt gd output [$GD_IDS] (no $want)" ;; esac
+done
+[ -z "$GD98" ] || fail 'displayable 98 already exists (another renderer?)'
+[ "$Q_DECLARED" = no ] || fail "context $CTX already declared; reboot first"
+if renderer_alive; then fail "a renderer from an earlier run is alive (pid $r_pid); run restore"; fi
+[ -n "$MAIN_CTX" ] || fail 'main display context is UNKNOWN'
+BASE_CTX=$CL_CTX; BASE_LIST=$CL_LIST; BASE_MAIN=$MAIN_CTX
+echo "$BASE_CTX $BASE_LIST" > "$BASEFILE"
+echo "$BASE_MAIN" > "$MAINFILE"
+live "BASELINE_CONTEXT: $BASE_CTX list=[$BASE_LIST] main=$BASE_MAIN"
+snap baseline-stock
+photo baseline-stock 'stock cluster before any change'
+sleep "$HOLD"
+
+# 1. Registration: 98 exists but is not composed (cluster must look unchanged).
+render_start
+snap registered-not-composed
+[ "$CL_CTX" = "$BASE_CTX" ] || fail 'cluster context changed when the renderer started'
+
+# 2. Declare the test context and switch the cluster to it.
+mkdir "$RUN/dc"
+dm "$RUN/dc/dc.txt" dc "$CTX" $TEST_LIST || fail "dmdt dc $CTX"
+dm "$RUN/dc/gc.txt" gc || fail 'dmdt gc after dc'
+ctx_declared "$RUN/dc/gc.txt" || fail "context $CTX not declared after dc"
+[ "$GC_FORMAT" = parsed ] || fail "dmdt gc output $GC_FORMAT ($GC_COUNT) after dc"
+[ "$GC_LIST" = "$TEST_LIST" ] || fail "declared context $CTX lists [$GC_LIST]"
+echo "DECLARED: $CTX list=[$TEST_LIST] gc_format=$GC_FORMAT"
+switch_to "$CTX" "$TEST_LIST" enter
+
+# 3. Idle renderer on the composed context: must be fully transparent.
+sleep "$SETTLE"
+snap idle-transparent; expect_ours idle
+photo idle-transparent 'renderer connected to nothing: expect stock map, no overlay, nothing black'
+sleep "$HOLD"
+
+# 4. Geometry grid, then maneuvers.
+scene grid 'green/cyan 8x6 grid: note which cells are visible and where' grid
+scene turn-right 'right turn arrow with bargraph 8/16' turn 90 8
+scene turn-left 'left turn arrow' turn -90
+scene roundabout 'roundabout, exit 135 deg' roundabout 135
+scene uturn 'U-turn' uturn
+scene arrived 'arrival flag' arrived
+
+# 5. Link loss: feeder gone -> renderer must blank itself.
+sleep "$SETTLE"
+snap after-link-loss; expect_ours after-link-loss
+photo after-link-loss 'no feeder: arrow must be gone, stock map visible'
+sleep "$HOLD"
+
+# 6. Graceful exit while composed.
+feed_start 15 shutdown
+feed_finish
+render_wait_exit 10
+sleep "$SETTLE"
+snap renderer-exited
+photo renderer-exited 'renderer exited while context is ours: record what the VC shows'
+sleep "$HOLD"
+
+# 7. Restart on the composed context, then crash it (SIGKILL).
+render_start
+feed_start "$((HOLD * 3))" wait-eof
+feed_wait EVT_FRAME_READY 15
+sleep "$SETTLE"
+snap restarted; expect_ours restarted
+photo restarted 'restarted renderer: right arrow should be back'
+sleep "$HOLD"
+kill -9 "$RPID"
+live 'SIGKILL sent to renderer'
+feed_finish
+render_wait_exit 5
+sleep "$SETTLE"
+snap renderer-killed
+photo renderer-killed 'renderer killed: record what the VC shows'
+sleep "$HOLD"
+
+# 8. Back to the stock context.
+switch_to "$BASE_CTX" "$BASE_LIST" restore
+SWITCHED=0
+sleep "$SETTLE"
+snap restored-stock
+[ -z "$GD98" ] || fail 'displayable 98 still registered after renderer exit'
+photo restored-stock "stock context $BASE_CTX again: compare with photo 1"
+sleep "$HOLD"
+live "F4_STEPS_DONE snapshots=$SN renderers=$RN feeds=$FN"

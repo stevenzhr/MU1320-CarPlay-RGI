@@ -1,0 +1,44 @@
+###########################################################################################
+#
+# MU1320 RGI green menu screen (Toolbox v1: F7 daily package)
+# Author:       mu1320-rgi
+# Version:      v1
+#
+###########################################################################################
+#
+# Main -> MQBCoding -> Customization -> MU1320 RGI
+# Replaces the Toolbox v0 diagnostics page (same file name).  Every button runs f7.sh of
+# the one SD folder mu1320-f7-*/ that carries TOOLBOX-ENTRY; details go to its out/.
+#
+###########################################################################################
+screen "MU1320 RGI" Customization
+
+keyValue
+    value   String sys 0x00000000 0
+    label   "F7 CarPlay RGI. SD: one mu1320-f7-* folder with TOOLBOX-ENTRY"
+    poll    0
+
+script
+   value   sys 1 0x0100 "/eso/hmi/engdefs/scripts/mqb/mu1320/f7_status.sh"
+   label   "1 Status (read-only)"
+
+script
+   value   sys 1 0x0100 "/eso/hmi/engdefs/scripts/mqb/mu1320/f7_install.sh"
+   label   "2 Install (then full restart)"
+
+script
+   value   sys 1 0x0100 "/eso/hmi/engdefs/scripts/mqb/mu1320/f7_uninstall.sh"
+   label   "3 Uninstall (then full restart)"
+
+script
+   value   sys 1 0x0100 "/eso/hmi/engdefs/scripts/mqb/mu1320/f7_collect.sh"
+   label   "4 Collect logs to SD (before locking the car)"
+
+keyValue
+    value   String sys 0x00000000 0
+    label   ""
+    poll    0
+
+script
+   value   sys 1 0x0100 "/eso/hmi/engdefs/scripts/mqb/mu1320/f7_stop.sh"
+   label   "5 EMERGENCY STOP (until the next restart)"

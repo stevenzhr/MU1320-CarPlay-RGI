@@ -1,0 +1,72 @@
+#!/bin/sh
+set -eu
+for var in LD_PRELOAD LD_DEBUG DL_DEBUG LD_DEBUG_OUTPUT; do unset "$var" || :; done
+PATH=/proc/boot:/bin:/usr/bin:/sbin:/usr/sbin:/mnt/app/armle/bin:/mnt/app/armle/usr/bin
+export PATH
+phase=${1:-snapshot}; case "$phase" in armed|restored|snapshot) ;; *) exit 2 ;; esac
+MARKER='MU1320_NAVJAVA_TRIAL=mu1320_navjava_v1_8b972a0d'
+PRELOAD='LD_PRELOAD=/mnt/app/root/mu1320-rgi-navjava-v1/libcarplay_hook.so'
+SYSTEM=/mnt/system/etc/eso/production/smartphone_integrator.json; ACTIVE=/etc/eso/production/smartphone_integrator.json
+for utility in pidin mkdir cat cksum tr sync cp grep uname date; do command -v "$utility" >/dev/null 2>&1 || { echo "STOP: missing $utility"; exit 2; }; done
+case "$0" in */*) sd_dir=${0%/*} ;; *) exit 2 ;; esac
+sd_dir=$(CDPATH= cd "$sd_dir" && pwd -P); case "$sd_dir" in /fs/sda0/*|/fs/sdb0/*) ;; *) echo 'STOP: collector must run from SD'; exit 2 ;; esac
+umask 077; out="$sd_dir/out"; [ -d "$out" ] || mkdir "$out"; [ ! -L "$out" ] || exit 2
+logdir="$out/$phase-$$"; mkdir "$logdir"
+snapshot() { pidin -F '%a %e %256n'; }; identity() { pidin -p "$1" -F '%a %e %256n %t'; }
+observe() {
+    p=$1; role=$2; echo "PROCESS_BEGIN: role=$role pid=$p"
+    before=$(identity "$p" 2>&1); brc=$?; printf '%s\n' "$before"
+    envfile="$logdir/$role-$p-environment.txt"; pidin -p "$p" environment > "$envfile" 2>&1; erc=$?
+    echo "ENVIRONMENT_BEGIN: exit=$erc file=$envfile"; cat "$envfile"; echo ENVIRONMENT_END
+    if [ "$role" = DIO ]; then
+        receipt="/tmp/mu1320-navhook-v1-gate-$p"; echo GATE_RECEIPT_BEGIN
+        if [ -f "$receipt" ] && [ ! -L "$receipt" ]; then cp "$receipt" "$logdir/$role-$p-gate-receipt.txt"; cat "$receipt"; else echo NO_RECEIPT; fi
+        echo GATE_RECEIPT_END
+    fi
+    memfile="$logdir/$role-$p-mem.txt"; pidin -p "$p" mem > "$memfile" 2>&1; mrc=$?
+    echo "MEMORY_MAP_BEGIN exit=$mrc"; cat "$memfile"; echo MEMORY_MAP_END
+    after=$(identity "$p" 2>&1); arc=$?; echo IDENTITY_AFTER; printf '%s\n' "$after"
+    if [ "$arc" != 0 ] || [ "$brc" != 0 ] || [ "$before" != "$after" ] || [ "$erc" != 0 ]; then echo OBSERVATION_INVALID_OR_CHANGED
+    elif [ "$role" = DIO ]; then
+        has_marker=0; has_preload=0; grep "$MARKER" "$envfile" >/dev/null 2>&1 && has_marker=1 || :; grep "$PRELOAD" "$envfile" >/dev/null 2>&1 && has_preload=1 || :
+        echo "DIO_ENV_MARKER=$has_marker DIO_ENV_PRELOAD=$has_preload"
+    fi
+    echo PROCESS_END
+}
+collect() {
+    echo "NAVJAVA_COLLECT_BEGIN phase=$phase"; uname -a; date
+    echo CONFIG_CHECKSUMS; cksum "$SYSTEM" "$ACTIVE"
+    echo ACTIVE_ARCHIVES; cksum /mnt/app/eso/hmi/lsd/jars/NavActiveIgnore.jar 2>&1 || :; cksum /mnt/app/eso/hmi/lsd/jars/CarPlayRGI-MU1320-IngressV1.jar 2>&1 || :
+    echo RAM_MARKERS; for f in /tmp/mu1320-navhook-v1.arm /tmp/carplay_verbose; do if [ -e "$f" ] || [ -L "$f" ]; then echo "PRESENT: $f"; else echo "ABSENT: $f"; fi; done
+    echo ALL_GATE_RECEIPTS_BEGIN
+    # Globbing is intentionally enabled here. The earlier collector's global
+    # `set -f` made this enumerate the literal pattern instead of receipts.
+    receipt_count=0
+    for f in /tmp/mu1320-navhook-v1-gate-*; do
+        if [ -f "$f" ] && [ ! -L "$f" ]; then receipt_count=$((receipt_count+1)); echo "FILE: $f"; cat "$f"; fi
+    done
+    echo "GLOBAL_GATE_RECEIPT_COUNT=$receipt_count"; echo ALL_GATE_RECEIPTS_END
+    echo JAVA_LOGS_BEGIN
+    for f in /tmp/carplay_java.log /tmp/carplay_java.log.1; do echo "FILE: $f"; if [ -f "$f" ] && [ ! -L "$f" ]; then name=${f##*/}; cp "$f" "$logdir/$name"; cat "$f"; else echo NO_LOG; fi; done
+    echo JAVA_LOGS_END
+    java_ok=0; java_reject=0
+    if [ -f /tmp/carplay_java.log ]; then java_ok=$(grep -c 'RGI-Ingress.*PARSE_OK' /tmp/carplay_java.log 2>/dev/null || :); java_reject=$(grep -c 'RGI-Ingress.*PARSE_REJECT' /tmp/carplay_java.log 2>/dev/null || :); fi
+    echo "JAVA_PARSE_OK_COUNT=${java_ok:-0}"; echo "JAVA_PARSE_REJECT_COUNT=${java_reject:-0}"
+    echo HOOK_LOGS_BEGIN
+    for f in /tmp/carplay_hook.log /tmp/carplay_hook.log.1 /tmp/carplay_hook.log.2 /tmp/carplay_hook.log.3; do echo "FILE: $f"; if [ -f "$f" ] && [ ! -L "$f" ]; then name=${f##*/}; cp "$f" "$logdir/$name"; cat "$f"; else echo NO_LOG; fi; done
+    echo HOOK_LOGS_END
+    snapshot > "$logdir/processes.txt" 2>&1; src=$?; echo "PROCESS_TABLE_BEGIN exit=$src"; cat "$logdir/processes.txt"; echo PROCESS_TABLE_END; [ "$src" = 0 ] || return 1
+    si=' '; while read -r p parent name rest; do case "$p" in ''|*[!0-9]*) continue;; esac; case "$name" in */smartphone_integrator|smartphone_integrator) si="$si$p " ;; esac; done < "$logdir/processes.txt"
+    count=0; seen=' '
+    while read -r p parent name rest; do
+        case "$p" in ''|*[!0-9]*) continue;; esac; case "$seen" in *" $p "*) continue;; esac
+        case "$name" in */smartphone_integrator|smartphone_integrator) role=SI ;; */dio_manager|dio_manager) role=DIO; count=$((count+1)); case "$si" in *" $parent "*) echo "DIRECT_SI_PARENT: dio=$p si=$parent";; *) echo "DIO_PARENT_NOT_SI: dio=$p parent=$parent";; esac ;; *) continue;; esac
+        seen="$seen$p "; observe "$p" "$role"
+    done < "$logdir/processes.txt"
+    echo "DIO_PROCESSES_OBSERVED=$count"; [ "$count" != 0 ] || echo INCONCLUSIVE_NO_DIO
+    echo 'INTERPRETATION: success requires stable active DIO + ACTIVE_TOKEN_CONSUMED + hook 0x52xx + Java PARSE_OK with zero PARSE_REJECT'
+    echo 'PRIVACY: logs can contain route names and destinations; keep the raw directory private'
+    echo "NAVJAVA_COLLECT_END phase=$phase"
+}
+set +e; collect > "$logdir/collect.txt" 2>&1; rc=$?; set -e
+cat "$logdir/collect.txt"; echo "COLLECT_EXIT=$rc"; sync || echo 'WARNING: sync failed'; echo "SAVED_ON_SD: $logdir"; exit "$rc"

@@ -1,0 +1,59 @@
+MU1320 F8 长期稳定性观察表（被测版本：F7 v2.1 = F7 v2 运行代码不变 + 自动监测 + SD 锁 + purge 重启保护）
+开始日期：                 结束日期：                 车机版本：MU1320 P4246
+iPhone / iOS 版本：                  Apple Maps / Google Maps 版本：
+开始前车上是原厂基线？（是 / 否）：
+
+每格填：P 通过   F 失败   U 未测   N 应用未提供   NA 不适用
+“地图框” = VC 地图上 CarPlay 画的箭头；“BAP 箭头” = VC/HUD 上的转向箭头。“菜单” = 绿色菜单 Customization > MU1320 RGI。
+SD 上只放 mu1320-f7-daily-v2.1（带 TOOLBOX-ENTRY）和 mu1320-f7-daily-v1.1；mu1320-f7-daily-v2 拿掉。
+
+=== 场次 L（清理 v1.1 遗留，SSH） ===
+L1  f7.sh status 的 OTHER_WORKSPACES =
+L2  v1.1 的 f7.sh purge：F7_PURGED？F7_ACTION_PASSED？
+L3  再看 status：OTHER_WORKSPACES =
+
+=== 场次 I（安装，菜单） ===
+I1  2 Install：RESULT: OK？用时约：
+I2  完整重启后 1 Status：SI: F7_TRIAL/F7_TRIAL、JAVA: F7_INSTALLED、LISTENER: F7_READY？
+
+=== 场次 M（停车确认监测，约 10 分钟） ===
+M1  连 CarPlay、Apple Maps 开始路线：地图框 + BAP 箭头 + HUD 与 F7 v2 相同？
+M2  5 分钟后 status：F8_MONITOR = RUNNING？F8_MONITOR_STATE 里 flushes =      mirror =
+M3  4 Collect：RESULT: OK？
+M4  熄火后取卡：out/f8/boot-1-…/samples.txt 和 logs/ 都在？
+
+=== 场次 N（日常使用，至少 10 次冷启动） ===
+          日期      冷启动次数  导航应用（A/G）  休眠唤醒  正常拔插  连续导航最长（分钟）  异常（无 / 简述）  按过 Collect？
+N1
+N2
+N3
+N4
+N5
+N6
+N7
+N8
+N9
+N10
+
+=== 专项（在场次 N 里完成即可） ===
+S1  短暂熄火不锁车再启动（MMI 休眠/唤醒）后，CarPlay 和箭头自动恢复？次数：
+S2  导航中正常拔插 USB（间隔 10 秒以上），重新连接后箭头恢复？次数：
+S3  导航中 Apple Maps ↔ Google Maps 切换，箭头跟着切换、没有残留？次数：
+S4  连续导航 60 分钟以上，箭头、地图框、HUD 一直正常、没有卡顿？最长：     分钟
+S5  多日使用后 MMI 反应速度、开机速度与装之前一样？
+
+=== 原车功能回归 ===
+U1  电话（来电、拨出、通话中导航）
+U2  Siri / 语音
+U3  音乐 / 收音机
+U4  倒车影像
+U5  触摸板 / 旋钮操作 CarPlay
+U6  SD 卡上的其他内容（Toolbox 菜单本身）正常
+
+=== 场次 X（最终卸载与重装，菜单） ===
+X1  USB 断开后 3 Uninstall：RESULT: OK？
+X2  完整重启后 1 Status：SI: BASELINE/BASELINE、JAVA: ABSENT、NAVIGNORE: ACTIVE_BASELINE？连 CarPlay：原厂行为？
+X3  2 Install → 完整重启 → 连 CarPlay 开始路线：一切恢复？F8_MONITOR = RUNNING？
+X4  最后留在什么状态：（已安装 / 原厂）
+
+结论 / 其他异常：

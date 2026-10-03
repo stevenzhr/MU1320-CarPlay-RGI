@@ -1,0 +1,67 @@
+#!/bin/sh
+# Read-only baseline comparison. No install, remount, signal, device write, or reboot.
+# Keep this on SD. Checksums detect accidental mismatch; they are not signatures.
+PATH=/proc/boot:/bin:/usr/bin:/sbin:/usr/sbin:/mnt/app/armle/bin:/mnt/app/armle/usr/bin
+export PATH
+problems=0
+echo 'MU1320 read-only preflight, 2026-09-22 baseline'
+os_info=`uname -a` || exit 2
+case "$os_info" in
+    QNX\ *\ 6.5.0\ *\ armle) echo 'PASS: QNX 6.5 ARM platform string' ;;
+    *) echo 'STOP: unexpected OS; no further checks performed'; exit 2 ;;
+esac
+for utility in cksum cmp pidin; do
+    command -v "$utility" >/dev/null 2>&1 || {
+        echo "STOP: missing $utility"
+        exit 2
+    }
+done
+while read wanted_crc wanted_size vehicle_file; do
+    actual=`cksum "$vehicle_file" 2>/dev/null`
+    if [ "$?" -ne 0 ]; then
+        echo "FAIL: unreadable $vehicle_file"
+        problems=1
+        continue
+    fi
+    # Disable globbing before splitting tool output; compare numeric CRC and byte count.
+    set -f
+    set -- $actual
+    if [ "${1:-}" = "$wanted_crc" ] && [ "${2:-}" = "$wanted_size" ]; then
+        echo "PASS: $vehicle_file"
+    else
+        echo "FAIL: differs from audited baseline: $vehicle_file"
+        problems=1
+    fi
+done <<'BASELINE_CKSUMS'
+@CHECKSUM_ROWS@
+BASELINE_CKSUMS
+
+for configuration in dio_manager.json smartphone_integrator.json; do
+    if cmp "/etc/eso/production/$configuration" "/mnt/system/etc/eso/production/$configuration" >/dev/null 2>&1; then
+        echo "PASS: config contents identical: $configuration (does not prove path aliases)"
+    else
+        echo "FAIL: config paths unreadable or unequal: $configuration"
+        problems=1
+    fi
+done
+echo 'Selected process names only; arguments intentionally omitted'
+pidin ar | while read process_id executable arguments; do
+    case "$executable" in
+        */j9|*/dio_manager|*/sshd|*/smartphone_integrator)
+            echo "$process_id $executable"
+            ;;
+    esac
+done
+echo 'INFO: chown discovery (absence is not permission to change tools)'
+command -v chown || echo 'NOT FOUND in this PATH'
+echo 'INFO: stock TLS library paths; metadata only'
+for tls_file in /lib/libssl.so.2 /lib/libcrypto.so.2 /mnt/app/armle/usr/lib/libssl.so.2 /mnt/app/armle/usr/lib/libcrypto.so.2; do
+    [ ! -f "$tls_file" ] || ls -l "$tls_file"
+done
+if [ "$problems" -ne 0 ]; then
+    echo 'BASELINE_CHECK_FAILED: stop and inspect differences; no files were modified.'
+    exit 1
+fi
+echo 'BASELINE_CHECK_PASSED: read-only file checks only; NOT permission or proof for installation.'
+echo 'Native build and independent recovery remain unverified. No files were modified.'
+exit 0

@@ -1,0 +1,65 @@
+#!/bin/sh
+set -eu
+set -f
+for var in LD_PRELOAD LD_DEBUG DL_DEBUG LD_DEBUG_OUTPUT; do unset "$var" || :; done
+PATH=/proc/boot:/bin:/usr/bin:/sbin:/usr/sbin:/mnt/app/armle/bin:/mnt/app/armle/usr/bin
+export PATH
+phase=${1:-snapshot}; case "$phase" in armed|restored|snapshot) ;; *) exit 2 ;; esac
+MARKER='MU1320_NAVHOOK_TRIAL=mu1320_navhook_v1_5c45c31e'
+PRELOAD='LD_PRELOAD=/mnt/app/root/mu1320-rgi-navhook-v1/libcarplay_hook.so'
+SYSTEM=/mnt/system/etc/eso/production/smartphone_integrator.json; ACTIVE=/etc/eso/production/smartphone_integrator.json
+for utility in pidin mkdir cat cksum tr sync cp grep uname date; do command -v "$utility" >/dev/null 2>&1 || { echo "STOP: missing $utility"; exit 2; }; done
+case "$0" in */*) sd_dir=${0%/*} ;; *) exit 2 ;; esac
+sd_dir=$(CDPATH= cd "$sd_dir" && pwd -P); case "$sd_dir" in /fs/sda0/*|/fs/sdb0/*) ;; *) echo 'STOP: collector must run from SD'; exit 2 ;; esac
+umask 077; out="$sd_dir/out"; [ -d "$out" ] || mkdir "$out"; [ ! -L "$out" ] || exit 2
+logdir="$out/$phase-$$"; mkdir "$logdir"
+snapshot() { pidin -F '%a %e %256n'; }; identity() { pidin -p "$1" -F '%a %e %256n %t'; }
+observe() {
+    p=$1; role=$2; echo "PROCESS_BEGIN: role=$role pid=$p"
+    before=$(identity "$p" 2>&1); brc=$?; printf '%s\n' "$before"
+    ok=0; while read -r rp parent name rest; do if [ "$rp" = "$p" ]; then case "$name:$role" in */dio_manager:DIO|dio_manager:DIO|*/smartphone_integrator:SI|smartphone_integrator:SI) ok=1 ;; esac; fi; done <<EOF
+$before
+EOF
+    if [ "$brc" != 0 ] || [ "$ok" != 1 ]; then echo INVALID_IDENTITY; echo PROCESS_END; return; fi
+    envfile="$logdir/$role-$p-environment.txt"; pidin -p "$p" environment > "$envfile" 2>&1; erc=$?
+    echo "ENVIRONMENT_BEGIN: exit=$erc file=$envfile"; cat "$envfile"; echo ENVIRONMENT_END
+    receipt="/tmp/mu1320-navhook-v1-gate-$p"; echo GATE_RECEIPT_BEGIN
+    if [ -f "$receipt" ] && [ ! -L "$receipt" ]; then cp "$receipt" "$logdir/$role-$p-gate-receipt.txt"; cat "$receipt"; else echo NO_RECEIPT; fi
+    echo GATE_RECEIPT_END
+    memfile="$logdir/$role-$p-mem.txt"; pidin -p "$p" mem > "$memfile" 2>&1; mrc=$?
+    echo "MEMORY_MAP_BEGIN exit=$mrc"; cat "$memfile"; echo MEMORY_MAP_END
+    after=$(identity "$p" 2>&1); arc=$?; echo IDENTITY_AFTER; printf '%s\n' "$after"
+    if [ "$arc" != 0 ] || [ "$before" != "$after" ] || [ "$erc" != 0 ]; then echo OBSERVATION_INVALID_OR_CHANGED
+    elif [ "$role" = DIO ]; then
+        has_marker=0; has_preload=0; grep "$MARKER" "$envfile" >/dev/null 2>&1 && has_marker=1 || :; grep "$PRELOAD" "$envfile" >/dev/null 2>&1 && has_preload=1 || :
+        echo "DIO_ENV_MARKER=$has_marker DIO_ENV_PRELOAD=$has_preload"
+    fi
+    echo PROCESS_END
+}
+collect() {
+    echo "NAVHOOK_COLLECT_BEGIN phase=$phase"; uname -a; date
+    echo CONFIG_CHECKSUMS; cksum "$SYSTEM" "$ACTIVE"
+    for f in /tmp/mu1320-navhook-v1-install-witness /tmp/mu1320-navhook-v1-rollback-witness /tmp/mu1320-navhook-v1.arm /tmp/carplay_verbose; do if [ -e "$f" ] || [ -L "$f" ]; then echo "RAM_FILE_PRESENT: $f"; else echo "RAM_FILE_ABSENT: $f"; fi; done
+    echo ALL_GATE_RECEIPTS_BEGIN
+    for f in /tmp/mu1320-navhook-v1-gate-*; do if [ -f "$f" ] && [ ! -L "$f" ]; then echo "FILE: $f"; cat "$f"; fi; done
+    echo ALL_GATE_RECEIPTS_END
+    echo HOOK_LOGS_BEGIN
+    for f in /tmp/carplay_hook.log /tmp/carplay_hook.log.1 /tmp/carplay_hook.log.2 /tmp/carplay_hook.log.3; do
+        echo "FILE: $f"; if [ -f "$f" ] && [ ! -L "$f" ]; then name=${f##*/}; cp "$f" "$logdir/$name"; cat "$f"; else echo NO_LOG; fi
+    done
+    echo HOOK_LOGS_END
+    echo PID_FILES_BEGIN; for f in /ramdisk/var/run/smartphone_integrator.pid /ramdisk/var/run/smartphone_integrator_children.pid; do echo "FILE: $f"; if [ -f "$f" ]; then cat "$f"; else echo MISSING; fi; done; echo PID_FILES_END
+    snapshot > "$logdir/processes.txt" 2>&1; src=$?; echo "PROCESS_TABLE_BEGIN exit=$src"; cat "$logdir/processes.txt"; echo PROCESS_TABLE_END; [ "$src" = 0 ] || return 1
+    si=' '; while read -r p parent name rest; do case "$p" in ''|*[!0-9]*) continue;; esac; case "$name" in */smartphone_integrator|smartphone_integrator) si="$si$p " ;; esac; done < "$logdir/processes.txt"
+    count=0; seen=' '
+    while read -r p parent name rest; do
+        case "$p" in ''|*[!0-9]*) continue;; esac; case "$seen" in *" $p "*) continue;; esac
+        case "$name" in */smartphone_integrator|smartphone_integrator) role=SI ;; */dio_manager|dio_manager) role=DIO; count=$((count+1)); case "$si" in *" $parent "*) echo "DIRECT_SI_PARENT: dio=$p si=$parent";; *) echo "DIO_PARENT_NOT_SI: dio=$p parent=$parent";; esac ;; *) continue;; esac
+        seen="$seen$p "; observe "$p" "$role"
+    done < "$logdir/processes.txt"
+    echo "DIO_PROCESSES_OBSERVED=$count"; [ "$count" != 0 ] || echo INCONCLUSIVE_NO_DIO
+    echo 'INTERPRETATION: collection success is not hook success; correlate gate receipt, token, map, log and stable DIO identity'
+    echo "NAVHOOK_COLLECT_END phase=$phase"
+}
+set +e; collect > "$logdir/collect.txt" 2>&1; rc=$?; set -e
+cat "$logdir/collect.txt"; echo "COLLECT_EXIT=$rc"; sync || echo 'WARNING: sync failed'; echo "SAVED_ON_SD: $logdir"; exit "$rc"

@@ -1,0 +1,140 @@
+#!/bin/sh
+# Read processes by numeric PID; keep full, unfiltered output on the SD card.
+# /tmp is /dev/shmem on MU1320 and cannot hold directories (mkdir -> ENOSYS).
+set -eu
+set -f
+for var in LD_PRELOAD LD_DEBUG DL_DEBUG LD_DEBUG_OUTPUT; do unset "$var" || :; done
+PATH=/proc/boot:/bin:/usr/bin:/sbin:/usr/sbin:/mnt/app/armle/bin:/mnt/app/armle/usr/bin
+export PATH
+phase=${1:-snapshot}
+case "$phase" in before|marked|restored|snapshot) ;; *) exit 2 ;; esac
+MARKER=@MARKER@
+SYSTEM=/mnt/system/etc/eso/production/smartphone_integrator.json
+ACTIVE=/etc/eso/production/smartphone_integrator.json
+for utility in pidin mkdir cat cksum tr sync; do command -v "$utility" >/dev/null 2>&1 || { echo "STOP: missing $utility"; exit 2; }; done
+case "$0" in */*) sd_dir=${0%/*} ;; *) echo 'STOP: run via env_probe.sh'; exit 2 ;; esac
+sd_dir=$(CDPATH= cd "$sd_dir" && pwd -P) || exit 2
+# Output only on removable media next to the package, never a system partition.
+case "$sd_dir" in /fs/*) ;; *) echo "STOP: package must run from SD/USB under /fs, not $sd_dir"; exit 2 ;; esac
+umask 077
+out_dir="$sd_dir/out"
+if [ ! -d "$out_dir" ]; then mkdir "$out_dir" || { echo "STOP: cannot create $out_dir (SD write-protected or full?)"; exit 2; }; fi
+[ ! -L "$out_dir" ] || { echo "STOP: unsafe $out_dir"; exit 2; }
+logdir="$out_dir/$phase-$$"
+mkdir "$logdir" || { echo "STOP: cannot create $logdir"; exit 2; }
+expected="MU1320_SI_PROBE=$MARKER"
+# Numeric substrings from a PID file are candidates only. Never trust the file
+# without a matching full process name in a current pidin snapshot.
+pid_file=/ramdisk/var/run/smartphone_integrator_children.pid
+snapshot() { pidin -F '%a %e %256n'; }
+identity() { pidin -p "$1" -F '%a %e %256n %t'; }
+observe() {
+    obs_pid=$1; obs_role=$2
+    echo "PROCESS_BEGIN: role=$obs_role pid=$obs_pid"
+    identity_before=$(identity "$obs_pid" 2>&1); identity_rc=$?
+    printf '%s\n' "$identity_before"
+    # Reject a dead PID or a different process before reading its environment.
+    identity_ok=0
+    while read -r p parent name remainder; do
+        if [ "$p" = "$obs_pid" ]; then
+            case "$name:$obs_role" in */dio_manager:DIO|dio_manager:DIO|*/smartphone_integrator:SI|smartphone_integrator:SI) identity_ok=1 ;; esac
+        fi
+    done <<EOF
+$identity_before
+EOF
+    if [ "$identity_rc" != 0 ] || [ "$identity_ok" != 1 ]; then
+        echo 'OBSERVATION: INVALID_IDENTITY'; echo PROCESS_END; return
+    fi
+    echo 'USERS_BEGIN'
+    pidin -p "$obs_pid" users 2>&1
+    echo 'USERS_END'
+    env_file="$logdir/$obs_role-$obs_pid-environment.txt"
+    pidin -p "$obs_pid" environment > "$env_file" 2>&1; env_rc=$?
+    echo "ENVIRONMENT_BEGIN: exit=$env_rc file=$env_file"
+    cat "$env_file"
+    echo ENVIRONMENT_END
+    found=0; row=0; control=0
+    while IFS= read -r line || [ -n "$line" ]; do
+        case " $line " in *" $expected "*) found=1 ;; esac
+        case "$line" in *LD_LIBRARY_PATH=*) control=1 ;; esac
+        set -- $line
+        if [ "${1:-}" = "$obs_pid" ]; then row=1; fi
+    done < "$env_file"
+    identity_after=$(identity "$obs_pid" 2>&1); identity_after_rc=$?
+    echo IDENTITY_AFTER
+    printf '%s\n' "$identity_after"
+    if [ "$identity_after_rc" != 0 ] || [ "$identity_before" != "$identity_after" ] || [ "$env_rc" != 0 ] || [ "$row" != 1 ]; then
+        echo 'OBSERVATION: INVALID_OR_PROCESS_CHANGED'
+    elif [ "$found" = 1 ]; then
+        echo "MARKER_OBSERVED: role=$obs_role pid=$obs_pid"
+        if [ "$obs_role" = SI ]; then echo 'CAUTION: marker in SI parent; source attribution is confounded'; fi
+    elif [ "$control" != 1 ]; then
+        echo 'OBSERVATION: ENVIRONMENT_UNCONFIRMED (known LD_LIBRARY_PATH absent)'
+    else
+        echo "MARKER_NOT_OBSERVED: role=$obs_role pid=$obs_pid (not proof that SI JSON is unusable)"
+    fi
+    echo PROCESS_END
+}
+collect() {
+    echo "ENV_PROBE_COLLECT_BEGIN phase=$phase"
+    echo "EXPECTED_MARKER: $expected"
+    uname -a
+    date
+    echo 'CONFIG_CHECKSUMS'
+    cksum "$SYSTEM" "$ACTIVE"
+    for witness in /tmp/mu1320-env-probe-@VERSION@-install-witness /tmp/mu1320-env-probe-@VERSION@-rollback-witness; do
+        if [ -e "$witness" ] || [ -L "$witness" ]; then echo "RAM_WITNESS_PRESENT: $witness (full restart not established)";
+        else echo "RAM_WITNESS_ABSENT: $witness (supporting evidence only)"; fi
+    done
+    echo PID_FILES_BEGIN
+    for file in /ramdisk/var/run/smartphone_integrator.pid "$pid_file"; do
+        echo "FILE: $file"
+        if [ -f "$file" ]; then cat "$file"; else echo MISSING; fi
+        echo
+    done
+    echo PID_FILES_END
+    snapshot > "$logdir/processes.txt" 2>&1; snapshot_rc=$?
+    echo "PROCESS_TABLE_BEGIN exit=$snapshot_rc"
+    cat "$logdir/processes.txt"
+    echo PROCESS_TABLE_END
+    if [ "$snapshot_rc" != 0 ]; then echo 'OBSERVATION: INVALID_PROCESS_TABLE'; return 1; fi
+    child_candidates=' '
+    if [ -f "$pid_file" ]; then child_candidates=" $(tr -cs '0-9' ' ' < "$pid_file") "; fi
+    si_pids=' '; dio_count=0; seen=' '
+    # First resolve SI PID(s) to establish parent relationships for DIO.
+    while read -r p parent name remainder; do
+        case "$p" in ''|*[!0-9]*) continue ;; esac
+        case "$name" in */smartphone_integrator|smartphone_integrator) si_pids="$si_pids$p " ;; esac
+    done < "$logdir/processes.txt"
+    while read -r p parent name remainder; do
+        case "$p" in ''|*[!0-9]*) continue ;; esac
+        case "$seen" in *" $p "*) continue ;; esac
+        case "$name" in
+            */smartphone_integrator|smartphone_integrator) role=SI ;;
+            */dio_manager|dio_manager) role=DIO ;;
+            *) continue ;;
+        esac
+        seen="$seen$p "
+        if [ "$role" = DIO ]; then
+            dio_count=$((dio_count + 1))
+            case "$child_candidates" in *" $p "*) echo "PID_FILE_MATCH: $p" ;; *) echo "PID_FILE_NOT_MATCHED: $p (resolved via live full name)" ;; esac
+            case "$si_pids" in *" $parent "*) echo "DIRECT_SI_PARENT: dio=$p si=$parent" ;;
+                *) echo "PARENT_NOT_CONFIRMED_AS_SI: dio=$p parent=$parent" ;; esac
+        fi
+        observe "$p" "$role"
+    done < "$logdir/processes.txt"
+    echo "DIO_PROCESSES_OBSERVED=$dio_count"
+    if [ "$dio_count" = 0 ]; then echo 'OBSERVATION: INCONCLUSIVE_NO_DIO; this is not a negative marker result'; fi
+    echo 'INTERPRETATION: compare before/marked/restored, SI parent environment and restart evidence; no automatic preload decision'
+    echo "ENV_PROBE_COLLECT_END phase=$phase"
+}
+# Keep every byte before displaying it. pidin errors are evidence, not success.
+set +e
+collect > "$logdir/collect.txt" 2>&1
+collect_rc=$?
+cat "$logdir/collect.txt"
+echo "COLLECT_EXIT=$collect_rc"
+# Flush FAT before the user removes the card or restarts the unit.
+sync || echo 'WARNING: sync failed; do not remove the SD card yet'
+echo "SAVED_ON_SD: $logdir"
+exit "$collect_rc"

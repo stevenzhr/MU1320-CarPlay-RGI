@@ -1,0 +1,49 @@
+From: MU1320 RGI
+Subject: [PATCH] navhook v1.3: do not prune lane guidance by maneuver index
+
+BACKLOG B8, F6 v2 car run 2026-09-27.
+---
+--- a/hook/routeguidance/rgd_hook.c
++++ b/hook/routeguidance/rgd_hook.c
+@@ -746,34 +746,14 @@
+            (RGD_LANE_GUIDANCE_INDEX | RGD_LANE_INFORMATIONS);
+ }
+ 
++/* MU1320 navhook v1.3 (BACKLOG B8): iOS numbers lane guidance (0x5204)
++ * independently of maneuvers, so comparing a lane index with the lowest
++ * ManeuverList index pruned entries that were still ahead (Google/Apple send
++ * most of them at route start, Apple some mid-route).  Lane entries now live
++ * until rgd_maneuver_map_reset(); a full cache evicts the least recently used
++ * non-active entry in rgd_lane_slot_for_iap_index().  Nothing is pruned here. */
+ static bool rgd_prune_stale_lane_cache(void) {
+-    int min_idx;
+-    bool pruned = false;
+-
+-    if (!g_rgd.current_list_present) return false;
+-    if (g_rgd.current_list_count == 0) return false;
+-    if (g_rgd.last_route_state == RGD_STATE_REROUTING) return false;
+-
+-    min_idx = rgd_min_current_index();
+-    if (min_idx < 0) return false;
+-
+-    for (int i = 0; i < MANEUVER_CACHE_SIZE; i++) {
+-        uint16_t lane_idx = g_rgd.lane_slot_to_iap_idx[i];
+-        if (lane_idx == 0xFFFF) continue;
+-        if ((int)lane_idx >= min_idx) continue;
+-        if ((g_rgd.update_cache.present & RGD_UPD_LANE_INDEX) &&
+-            g_rgd.update_cache.lane_guidance_index == lane_idx) {
+-            continue;
+-        }
+-
+-        LOG_DEBUG(LOG_MODULE, "Pruning stale lane guidance slot %d (idx %u < current min %d)",
+-                  i, (unsigned)lane_idx, min_idx);
+-        g_rgd.lane_slot_to_iap_idx[i] = 0xFFFF;
+-        g_rgd.lane_slot_seq[i] = 0;
+-        g_rgd.lane_cache[i].present = 0;
+-        pruned = true;
+-    }
+-    return pruned;
++    return false;
+ }
+ 
+ /*

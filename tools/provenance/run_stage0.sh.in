@@ -1,0 +1,46 @@
+#!/bin/sh
+# Manual standalone check from SD. No install, remount, HMI signal or preload hook.
+PATH=/proc/boot:/bin:/usr/bin:/sbin:/usr/sbin:/mnt/app/armle/bin:/mnt/app/armle/usr/bin
+export PATH
+case "$0" in
+    */*) stage_dir=${0%/*} ;;
+    *) echo 'STOP: run /bin/sh /actual/SD/path/run_stage0.sh'; exit 2 ;;
+esac
+stage_dir=$(CDPATH= cd "$stage_dir" && pwd -P) || exit 2
+for utility in uname cksum; do
+    command -v "$utility" >/dev/null 2>&1 || { echo "STOP: missing $utility"; exit 2; }
+done
+platform=$(uname -a) || exit 2
+case "$platform" in
+    QNX\ *\ 6.5.0\ *\ armle) echo 'PASS: expected QNX platform' ;;
+    *) echo 'STOP: expected QNX 6.5.0 armle'; exit 2 ;;
+esac
+check_file() {
+    wanted_crc=$1
+    wanted_size=$2
+    checked_path=$3
+    actual=$(cksum "$checked_path" 2>/dev/null) || { echo "STOP: unreadable $checked_path"; return 1; }
+    set -f
+    set -- $actual
+    if [ "${1:-}" != "$wanted_crc" ] || [ "${2:-}" != "$wanted_size" ]; then
+        echo "STOP: checksum differs: $checked_path"
+        return 1
+    fi
+    echo "PASS: checksum $checked_path"
+}
+@CHECKS@
+echo 'MOUNT_OUTPUT_BEGIN'
+mount
+mount_status=$?
+echo "mount_exit=$mount_status"
+echo 'MOUNT_OUTPUT_END'
+echo 'Starting standalone native check (10-second self-timeout; no CarPlay activation)'
+LD_LIBRARY_PATH=/proc/boot:/lib LD_PRELOAD= "$stage_dir/native_smoke"
+native_status=$?
+echo "native_smoke_exit=$native_status"
+if [ "$native_status" -ne 0 ]; then
+    echo 'STOP: native check did not succeed. Preserve output; do not change mounts or retry with hooks.'
+    exit "$native_status"
+fi
+echo 'STAGE0_NATIVE_CHECK_PASSED: basic execution only; HMI recovery and RGI remain untested.'
+exit 0

@@ -1,0 +1,440 @@
+--- mu1320-f7-daily-v2/f7_render.sh
++++ mu1320-f7-daily-v2.1/f7_render.sh
+@@ -33,6 +33,25 @@
+ [ "$#" = 1 ] && [ "$1" = up ] || fail 252 "usage: $*"
+ n=$(size "$LOG"); case "$n" in ''|*[!0-9]*) ;; *) if [ "$n" -gt 262144 ]; then : > "$LOG"; out "LOG_TRUNCATED bytes=$n"; fi ;; esac
+ out "BEGIN pid=$$"
++# F7 v2.1 (F8): start the long-term monitor once per boot, before the HOLD exits so a
++# stopped boot keeps its record.  It never fails the keeper.
++MON=$ROOT/mon
++MON_RUN=/tmp/mu1320-f8-mon.run
++mon_start() {
++    [ -f "$JAR" ] || return 0
++    if exists /tmp/mu1320-f8-mon-off || exists "$ROOT/off-monitor"; then out 'MON off'; return 0; fi
++    m_pid=''
++    if [ -f "$MON_RUN" ]; then read -r m_pid < "$MON_RUN" || :; fi
++    case "$m_pid" in ''|*[!0-9]*) ;; *) if kill -0 "$m_pid" 2>/dev/null; then return 0; fi ;; esac
++    check 2255473972 11899 "$MON/f8_mon.sh" || { out 'MON_FAIL monitor checksum'; return 0; }
++    check 2952412687 7302 "$MON/mount_state" || { out 'MON_FAIL mount helper checksum'; return 0; }
++    check 292735868 8680 "$RENDER/f7_spawn" || { out 'MON_FAIL launcher checksum'; return 0; }
++    m_rc=0
++    "$RENDER/f7_spawn" /tmp/mu1320-f8-mon.pid /tmp/mu1320-f8-mon.log "$MON" /bin/sh "$MON/f8_mon.sh" run || m_rc=$?
++    if [ "$m_rc" = 0 ]; then out "MON SPAWNED pid=$(cat /tmp/mu1320-f8-mon.pid)"; else out "MON_FAIL f7_spawn exit $m_rc"; fi
++    return 0
++}
++mon_start
+ if exists "$HOLD"; then out 'HELD hold'; exit 10; fi
+ if exists "$ROOT/off-render"; then out 'HELD off-render'; exit 10; fi
+ if [ ! -f "$JAR" ]; then out 'HELD not-installed'; exit 10; fi
+--- mu1320-f7-daily-v2/collect_f7.sh
++++ mu1320-f7-daily-v2.1/collect_f7.sh
+@@ -56,7 +56,7 @@
+     for f in /tmp/mu1320-f7-gate.last /tmp/mu1320-f7-gate.strikes; do
+         if [ -f "$f" ] && [ ! -L "$f" ]; then echo "GATE_RECORD: $f $(cat "$f")"; else echo "GATE_RECORD: $f ABSENT"; fi
+     done
+-    for component_name in native render bap touchpad; do
++    for component_name in native render bap touchpad monitor; do
+         if [ -e "/mnt/app/root/mu1320-rgi-f7-v2/off-$component_name" ]; then echo "F7_SWITCH[$component_name]=OFF_PERSISTENT"; else echo "F7_SWITCH[$component_name]=on"; fi
+     done
+     echo JAVA_LOGS_BEGIN
+@@ -65,7 +65,7 @@
+     echo F7_FILES_BEGIN
+     # The capture holds sanitized frame diffs (free text replaced by tokens); it is
+     # copied for host replay, not printed.  State, BAP and render logs hold no road text.
+-    for f in /tmp/mu1320-f5-state.log /tmp/mu1320-f5-frames.cap /tmp/mu1320-f5-bap.log /tmp/mu1320-f5-render.log /tmp/mu1320-f5-renderer.log /tmp/mu1320-f5-geom.cfg /tmp/mu1320-f5-sc.log /tmp/mu1320-f5-ctx-mode /tmp/mu1320-f6-touchpad.log /tmp/mu1320-f7-keeper.log; do
++    for f in /tmp/mu1320-f5-state.log /tmp/mu1320-f5-frames.cap /tmp/mu1320-f5-bap.log /tmp/mu1320-f5-render.log /tmp/mu1320-f5-renderer.log /tmp/mu1320-f5-geom.cfg /tmp/mu1320-f5-sc.log /tmp/mu1320-f5-ctx-mode /tmp/mu1320-f6-touchpad.log /tmp/mu1320-f7-keeper.log /tmp/mu1320-f8-mon.log /tmp/mu1320-f8-mon.state /tmp/mu1320-f8-mon.buf; do
+         if [ -f "$f" ] && [ ! -L "$f" ]; then name=${f##*/}; cp "$f" "$logdir/$name"; echo "COPIED: $f $(cksum "$f")"; else echo "MISSING: $f"; fi
+     done
+     echo F7_FILES_END
+--- mu1320-f7-daily-v2/control.sh
++++ mu1320-f7-daily-v2.1/control.sh
+@@ -8,7 +8,7 @@
+ component=''
+ case "$action:$#" in status:1|install:1|stop:1|rollback:1|purge:1|collect:2) ;; off:2|on:2) component=$2; phase=snapshot ;; *) exit 2 ;; esac
+ case "$phase" in live|restored|snapshot) ;; *) exit 2 ;; esac
+-case "$component" in ''|native|render|bap|touchpad) ;; *) exit 2 ;; esac
++case "$component" in ''|native|render|bap|touchpad|monitor) ;; *) exit 2 ;; esac
+ case "$0" in */*) stage_dir=${0%/*} ;; *) exit 2 ;; esac
+ stage_dir=$(CDPATH= cd "$stage_dir" && pwd -P)
+ # F7 v2: green-menu scripts start with "." first in PATH and LD_LIBRARY_PATH, umask 000 and
+@@ -48,7 +48,7 @@
+ java_ok() { check 3555241766 147646 "$1" && [ "$(attrs "$1")" = '-rw-r--r-- 0 0' ]; }
+ run_clean() { (for var in LD_PRELOAD LD_DEBUG DL_DEBUG LD_DEBUG_OUTPUT; do unset "$var" || :; done; LD_LIBRARY_PATH=/proc/boot:/lib exec "$@"); }
+ check 2952412687 7302 "$stage_dir/mount_state" || fail 'mount helper checksum'
+-check 1029571756 10801 "$stage_dir/collect_f7.sh" || fail 'collector checksum'
++check 3136660668 10880 "$stage_dir/collect_f7.sh" || fail 'collector checksum'
+ check 3641631177 10620 "$stage_dir/f5_dm.sh" || fail 'displaymanager helper checksum'
+ check 1988489462 5403 "$stage_dir/f4_unbuf.so" || fail 'dmdt stdout shim checksum'
+ check 2992755173 34464 /mnt/app/eso/bin/apps/dmdt || fail 'dmdt baseline'
+@@ -83,7 +83,7 @@
+ echo "MOUNTS: app=$app_state system=$system_state"
+ echo "RUN_ENV: cwd=$(pwd) umask=$(umask) ld=${LD_LIBRARY_PATH:-unset}"
+ # Persistent component switches (files in the workspace; control.sh off|on <component>).
+-for component_name in native render bap touchpad; do
++for component_name in native render bap touchpad monitor; do
+     if exists "$ROOT/off-$component_name"; then echo "SWITCH_$component_name: OFF_PERSISTENT"; else echo "SWITCH_$component_name: on"; fi
+ done
+ echo "NATIVE_RUNTIME_OFF: $(exists "$NATIVE_OFF" && echo PRESENT || echo ABSENT)"
+@@ -93,6 +93,23 @@
+ if [ -f "$JAVA_LOG" ] && grep 'MU1320-F7-DAILY-V2 LISTENER_READY' "$JAVA_LOG" >/dev/null 2>&1; then echo 'JAVA_LISTENER: F7_READY'; else echo 'JAVA_LISTENER: ABSENT'; fi
+ keeper_last=NONE; if [ -f /tmp/mu1320-f7-keeper.log ]; then while read -r keeper_line; do case "$keeper_line" in 'KEEP '*) keeper_last=$keeper_line ;; esac; done < /tmp/mu1320-f7-keeper.log; fi
+ echo "KEEPER_LAST: $keeper_last"
++# F7 v2.1 (F8): the long-term monitor and any other workspace left in /mnt/app/root.
++MON_RUN=/tmp/mu1320-f8-mon.run
++mon_alive() {
++    mon_pid=''
++    if [ -f "$MON_RUN" ]; then read -r mon_pid < "$MON_RUN" || :; fi
++    case "$mon_pid" in ''|*[!0-9]*) return 1 ;; esac
++    kill -0 "$mon_pid" 2>/dev/null
++}
++mon_state=NONE; if [ -f /tmp/mu1320-f8-mon.state ]; then read -r mon_state < /tmp/mu1320-f8-mon.state || :; fi
++if mon_alive; then echo "F8_MONITOR: RUNNING pid=$mon_pid"; elif [ "$mon_state" != NONE ]; then echo 'F8_MONITOR: ENDED'; else echo 'F8_MONITOR: ABSENT'; fi
++echo "F8_MONITOR_STATE: $mon_state"
++other_ws=''; set +f
++for ws in /mnt/app/root/mu1320-rgi-*; do
++    if [ -d "$ws" ] && [ "$ws" != "$ROOT" ]; then other_ws="$other_ws ${ws##*/}"; fi
++done
++set -f
++echo "OTHER_WORKSPACES:${other_ws:- none}"
+ echo "EXPECTED_MARKER: MU1320_F7_TRIAL=$MARKER"
+ runtime_ok() {
+     [ -d "$ROOT" ] && [ ! -L "$ROOT" ] && [ -d "$ROOT/config" ] && [ -d "$ROOT/backup" ] && [ -d "$ROOT/quarantine" ] || fail 'unsafe runtime workspace'
+@@ -113,7 +130,10 @@
+     check 3641631177 10620 "$ROOT/render/f5_dm.sh" || fail 'runtime displaymanager helper checksum'
+     check 1988489462 5403 "$ROOT/render/f4_unbuf.so" || fail 'runtime dmdt stdout shim checksum'
+     check 292735868 8680 "$ROOT/render/f7_spawn" || fail 'runtime renderer launcher checksum'
+-    check 1042317273 4707 "$ROOT/render/f7_render.sh" || fail 'runtime renderer keeper checksum'
++    check 3779396577 5790 "$ROOT/render/f7_render.sh" || fail 'runtime renderer keeper checksum'
++    [ -d "$ROOT/mon" ] && [ ! -L "$ROOT/mon" ] || fail 'runtime monitor directory'
++    check 2255473972 11899 "$ROOT/mon/f8_mon.sh" || fail 'runtime monitor checksum'
++    check 2952412687 7302 "$ROOT/mon/mount_state" || fail 'runtime monitor mount helper checksum'
+     check 3518254750 798799 /mnt/app/eso/bin/apps/smartphone_integrator || fail "smartphone_integrator baseline"
+     check 399102352 682672 /mnt/app/eso/bin/apps/dio_manager || fail "dio_manager baseline"
+     check 863911487 179441 /lib/libsocket.so.3 || fail "libsocket.so.3 baseline"
+@@ -183,7 +203,7 @@
+     [ "$DISARM_CLUSTER_OK" = 1 ] || fail 'cluster not confirmed off context 80 (see WARNING); do a normal reboot, which clears context 80'
+     echo 'F7_STOPPED: BAP off (VC/HUD stock), renderer stopped and held, next DIO passive, until the next reboot; touchpad unchanged'; exit 0
+ fi
+-switch_note() { case "$1" in native) echo 'from the next DIO start (USB connect)' ;; *) echo 'within 2 s, no restart' ;; esac; }
++switch_note() { case "$1" in native) echo 'from the next DIO start (USB connect)' ;; monitor) echo 'off: within 60 s; on: from the next CarPlay session' ;; *) echo 'within 2 s, no restart' ;; esac; }
+ for utility in cp cmp mv chmod mkdir sync mount find rm; do command -v "$utility" >/dev/null 2>&1 || fail "missing $utility"; done
+ for directory in /mnt/app/root /mnt/app/eso/hmi/lsd "$JARS" /mnt/system/etc/eso/production; do [ -d "$directory" ] && [ ! -L "$directory" ] || fail "unsafe directory $directory"; done
+ if [ "$action" = install ]; then
+@@ -204,7 +224,8 @@
+     check 2017122787 917504 "$stage_dir/flag_atlas.rgba" || fail "flag_atlas.rgba payload checksum"
+     check 1010800451 2167 "$stage_dir/f5_sc.sh" || fail "f5_sc.sh payload checksum"
+     check 292735868 8680 "$stage_dir/f7_spawn" || fail "f7_spawn payload checksum"
+-    check 1042317273 4707 "$stage_dir/f7_render.sh" || fail "f7_render.sh payload checksum"
++    check 3779396577 5790 "$stage_dir/f7_render.sh" || fail "f7_render.sh payload checksum"
++    check 2255473972 11899 "$stage_dir/f8_mon.sh" || fail "f8_mon.sh payload checksum"
+     check 483111144 250996 /mnt/app/eso/hmi/lsd/jars/AppDevelopment.jar || fail "baseline archive differs: AppDevelopment.jar"
+     check 1252008303 23585 /mnt/app/eso/hmi/lsd/jars/DevelopmentStubEvo.jar || fail "baseline archive differs: DevelopmentStubEvo.jar"
+     check 2960431692 2645 /mnt/app/eso/hmi/lsd/jars/NavActiveIgnore.jar || fail "baseline archive differs: NavActiveIgnore.jar"
+@@ -269,6 +290,27 @@
+     navignore_ok "$OLD" || fail 'NavActiveIgnore must be back in the scan tree'
+     ! exists "$NEW" || fail 'F7 Java archive still installed'
+     ! renderer_alive || fail 'renderer still running; reboot first'
++    # F7 v2.1: purge only after the reboot that follows rollback (F7 v2 car run purged in
++    # the rollback boot): no F7 Java, monitor or hooked DIO may still be running.
++    for java_log in "$JAVA_LOG" "$JAVA_LOG.1"; do
++        if [ -f "$java_log" ] && grep 'MU1320-F7-DAILY-V2 LISTENER_READY' "$java_log" >/dev/null 2>&1; then
++            fail 'F7 Java ran in this boot: reboot after rollback, then purge'
++        fi
++    done
++    if mon_alive; then fail 'F8 monitor still running: reboot after rollback, then purge'; fi
++    command -v pidin >/dev/null 2>&1 || fail 'missing pidin'
++    table=$(pidin -F '%a %256n') || fail 'cannot inspect live processes'
++    while read -r p_pid p_name; do
++        case "$p_pid" in ''|*[!0-9]*) continue ;; esac
++        case "$p_name" in
++            *dio_manager*)
++                if pidin -p "$p_pid" environment 2>/dev/null | grep "$MARKER" >/dev/null 2>&1; then
++                    fail "DIO $p_pid carries the F7 hook: reboot after rollback, then purge"
++                fi ;;
++        esac
++    done <<PURGE_TABLE
++$table
++PURGE_TABLE
+     cmp "$OLD" "$ROOT/backup/NavActiveIgnore.jar" >/dev/null || fail 'NavActiveIgnore differs from its backup; preserve the workspace'
+     cmp "$SYSTEM" "$ROOT/backup/smartphone_integrator.json" >/dev/null || fail 'SI differs from its backup; preserve the workspace'
+ else
+@@ -334,7 +376,7 @@
+ if [ "$action" = install ]; then
+     echo 'install_STEP: prepare private runtime workspace'
+     umask 077
+-    for directory in "$ROOT" "$ROOT/backup" "$ROOT/config" "$ROOT/quarantine" "$ROOT/render"; do
++    for directory in "$ROOT" "$ROOT/backup" "$ROOT/config" "$ROOT/quarantine" "$ROOT/render" "$ROOT/mon"; do
+         if exists "$directory"; then [ -d "$directory" ] && [ ! -L "$directory" ] || fail "unsafe runtime directory $directory"
+         else mkdir "$directory" || fail "runtime mkdir $directory"; fi
+     done
+@@ -350,7 +392,9 @@
+     put_file "$stage_dir/f5_dm.sh" "$ROOT/render/f5_dm.sh" 644 3641631177 10620 'runtime displaymanager helper' plain
+     put_file "$stage_dir/f4_unbuf.so" "$ROOT/render/f4_unbuf.so" 644 1988489462 5403 'runtime dmdt stdout shim' plain
+     put_file "$stage_dir/f7_spawn" "$ROOT/render/f7_spawn" 755 292735868 8680 'runtime renderer launcher' plain
+-    put_file "$stage_dir/f7_render.sh" "$ROOT/render/f7_render.sh" 755 1042317273 4707 'runtime renderer keeper' plain
++    put_file "$stage_dir/f7_render.sh" "$ROOT/render/f7_render.sh" 755 3779396577 5790 'runtime renderer keeper' plain
++    put_file "$stage_dir/f8_mon.sh" "$ROOT/mon/f8_mon.sh" 755 2255473972 11899 'runtime monitor' plain
++    put_file "$stage_dir/mount_state" "$ROOT/mon/mount_state" 755 2952412687 7302 'runtime monitor mount helper' plain
+     sync || fail 'sync private runtime workspace'
+     runtime_ok; cmp "$OLD" "$ROOT/backup/NavActiveIgnore.jar" >/dev/null || fail 'NavActiveIgnore changed during backup'
+     phase_write BACKUPS_AND_RUNTIME_VERIFIED
+--- mu1320-f7-daily-v2/f7.sh
++++ mu1320-f7-daily-v2.1/f7.sh
+@@ -7,7 +7,8 @@
+ case "$*: $#" in
+   'status: 1'|'install: 1'|'stop: 1'|'rollback: 1'|'purge: 1'|'collect live: 2'|'collect restored: 2'|'collect snapshot: 2') ;;
+   'off native: 2'|'off render: 2'|'off bap: 2'|'off touchpad: 2'|'on native: 2'|'on render: 2'|'on bap: 2'|'on touchpad: 2') ;;
+-  *) echo 'usage: f7.sh status|install|stop|rollback|purge|collect live|restored|snapshot|off|on native|render|bap|touchpad'; exit 2 ;;
++  'off monitor: 2'|'on monitor: 2') ;;
++  *) echo 'usage: f7.sh status|install|stop|rollback|purge|collect live|restored|snapshot|off|on native|render|bap|touchpad|monitor'; exit 2 ;;
+ esac
+ requested_action=$1; requested_phase=${2:-}
+ case "$0" in */*) stage_dir=${0%/*} ;; *) exit 2 ;; esac
+@@ -26,9 +27,28 @@
+ uid=$(id -u); set -f; (set -- $uid; [ "$#" = 1 ] && [ "$1" = 0 ]) || fail 'effective UID must be 0'
+ case "$(uname -a)" in QNX\ *\ 6.5.0\ *\ armle) ;; *) fail 'wrong platform' ;; esac
+ output=$(cksum "$stage_dir/mount_state"); set -- $output; [ "${1:-}" = '2952412687' ] && [ "${2:-}" = '7302' ] || fail 'mount helper checksum'
+-output=$(cksum "$stage_dir/control.sh"); set -- $output; [ "${1:-}" = '1081284036' ] && [ "${2:-}" = '31194' ] || fail 'control checksum'
++output=$(cksum "$stage_dir/control.sh"); set -- $output; [ "${1:-}" = '2701278872' ] && [ "${2:-}" = '33746' ] || fail 'control checksum'
+ state() { (LD_LIBRARY_PATH=/proc/boot:/lib exec "$stage_dir/mount_state" "$sd"); }
+-initial=$(state) || fail 'SD mount query'; case "$initial" in ro|rw) ;; *) fail 'unknown SD mount state' ;; esac
++# F7 v2.1 (F8): the monitor remounts this SD for its flushes; both sides take the same
++# lock before they look at or change the mount state.  A dead holder is replaced.
++SD_LOCK=/tmp/mu1320-f8-sd.lock; sd_locked=0
++lock_holder() { lh=''; if [ -f "$SD_LOCK" ]; then read -r lh < "$SD_LOCK" || :; fi; echo "$lh"; }
++lock_take() {
++    if (set -C; echo "$$" > "$SD_LOCK") 2>/dev/null; then return 0; fi
++    lt=$(lock_holder)
++    case "$lt" in ''|*[!0-9]*) ;; *) if kill -0 "$lt" 2>/dev/null; then return 1; fi ;; esac
++    rm -f "$SD_LOCK" || return 1
++    (set -C; echo "$$" > "$SD_LOCK") 2>/dev/null
++}
++sd_unlock() { if [ "$sd_locked" = 1 ] && [ "$(lock_holder)" = "$$" ]; then rm -f "$SD_LOCK" || :; fi; sd_locked=0; }
++lock_wait=0
++while ! lock_take; do
++    [ "$lock_wait" -lt 30 ] || fail "SD busy for 30 s (F8 monitor flush, pid $(lock_holder)); press again"
++    sleep 1; lock_wait=$((lock_wait + 1))
++done
++sd_locked=1; [ "$lock_wait" = 0 ] || echo "SD_LOCK_WAITED: ${lock_wait}s"
++initial=$(state) || { sd_unlock; fail 'SD mount query'; }
++case "$initial" in ro|rw) ;; *) sd_unlock; fail 'unknown SD mount state' ;; esac
+ restore=0; log=''; completed=0; control_rc=255
+ cleanup() {
+     outer_rc=$?; trap - 0 1 2 15; set +e
+@@ -37,6 +57,7 @@
+     final=$(state); query=$?
+     if [ "$query" != 0 ] || [ "$final" != "$initial" ]; then echo "STOP: SD state not restored to $initial; do not remove card" >&2; outer_rc=1
+     else echo "SD_MOUNT_RESTORED: $sd=$final"; fi
++    sd_unlock
+     [ -z "$log" ] || echo "ACTION_LOG_ON_SD: $log"
+     echo "CONTROL_EXIT: $control_rc"; echo "OUTER_EXIT: $outer_rc"
+     echo 'EVIDENCE_NOTE: save this terminal tail with the SD action log; final SD state occurs after the log is closed.'
+--- mu1320-f7-daily-v2/TOOLBOX-ENTRY
++++ mu1320-f7-daily-v2.1/TOOLBOX-ENTRY
+@@ -1,3 +1,3 @@
+ MU1320_F7_TOOLBOX_ENTRY 1
+-build=MU1320-F7-DAILY-V2
++build=MU1320-F7-DAILY-V2.1
+ wrapper=f7.sh
+--- mu1320-f7-daily-v2/README.md
++++ mu1320-f7-daily-v2.1/README.md
+@@ -1,120 +1,108 @@
+-# MU1320 F7 日常运行候选包 v2（绿色菜单部署；v1.1 + B11/B12 修复）
++# MU1320 F7 v2.1：F8 长期稳定性固定候选（F7 v2 + 自动监测）
+ 
+-F7 v2 = **F7 v1.1（2026-09-27 场次 P 实车通过）+ 两处修复 + 绿色菜单入口**。日常安装、卸载、采集、应急停止都在
+-MMI 的绿色菜单里点按钮完成，不需要电脑；SSH 照常可用（`purge`、`off|on` 仍只用 SSH）。
++F7 v2.1 = **F7 v2（2026-10-02 结项）的全部运行代码不变**（hook、Java、renderer、SI/DIO 配置逐字节相同，车上工作目录仍是
++`/mnt/app/root/mu1320-rgi-f7-v2`），只加了一个长期监测脚本和三处脚本改动。F8 用它做多日、多次冷启动的稳定性验收，**不需要每次锁车前按 Collect**。
+ 
+-需要两样东西都在 SD 上：
++绿色菜单（`Customization > MU1320 RGI`，5 个按钮）和 Toolbox v1 都不变，不需要重刷 Toolbox。
+ 
+-1. **本文件夹** `mu1320-f7-daily-v2/`（放在 SD 根目录，名字不要改）。菜单只认带 `TOOLBOX-ENTRY` 文件的 F7 文件夹，SD 上**只能有一个**这样的文件夹。
+-2. **自制 Toolbox v1**（`mu1320-toolbox-v1/`，只需要用 Toolbox 自带的更新装一次，见该文件夹的 `MU1320-README.md`）。
+-   它把 v0 的诊断页换成 F7 页：`绿色菜单 > Customization > MU1320 RGI`。以后 F7 换版本不需要重刷 Toolbox。
++## 和 F7 v2 的差别
+ 
+-## 和 F7 v1.1 的差别
+-
+-`SHA256SUMS` 与 `reports/f7-v2-*.json|diff` 可核对。
++`SHA256SUMS` 与 `reports/f7-v2.1-scripts.diff` 可核对。
+ 
+ | 项 | 改动 | 来源 |
+ | --- | --- | --- |
+-| native hook | 闸门的 `gate.last`、`gate.strikes` 改为直接写入（`O_TRUNC`），不再先写临时文件再 `rename` | **B11**：车上 `/tmp` 是 `/dev/shmem`，不支持 rename，v1.1 这两个文件从未写出，崩溃保护（P4）和存活 DIO 守卫都没生效 |
+-| 脚本 `stop`/`rollback` | 先经 Java 关 BAP（运行时开关 `/tmp/mu1320-f5-bap-off`：BAP 拆除，VC/HUD 回原厂，Java 释放 context 80 并还原 KDK），等 Java 确认、displaymanager 离开 80，再停 renderer | **B12**：v1.1 的 stop 只停 renderer，BAP 还在发，VC/HUD 箭头要拔 USB 才消失（P7） |
+-| 脚本环境 | `f7.sh`、`control.sh` 先 `cd /`、`umask 022`，去掉 `LD_LIBRARY_PATH` 里的相对路径（`.`） | Toolbox v0 实车：绿色菜单脚本的 PATH/LD_LIBRARY_PATH 以 `.` 开头、umask 000 |
+-| status | 多一行 `RUN_ENV:`（cwd、umask、LD_LIBRARY_PATH），`stop` 多 `JAVA_RELEASE:`、`JAVA_CLUSTER_CONTEXT:` | 采集证据 |
+-| 菜单 | 新文件 `TOOLBOX-ENTRY` | 调度脚本据此找文件夹 |
+-| Java | **逻辑不变**：v1.1 字节码，只有版本名（BUILD_ID、工作目录）不同 | — |
++| 新文件 `f8_mon.sh` | 自动监测：安装到工作目录的 `mon/`。每次开机第一次连 CarPlay 时由 renderer keeper 启动（每次开机只有一个）；每 60 秒记录空闲内存、各相关进程（dio_manager、smartphone_integrator、j9、displaymanager、maneuver_render、screen、io-usb）的 CPU 时间、线程数、数据段和句柄数，以及 `/tmp` 里各日志的大小；每 2 分钟把记录追加到 SD，并把有变化的 F7 日志复制到 SD；每 10 分钟另存 `sloginfo` 和 `/mnt/ota` 转储目录清单 | **B10**（日志断电即丢）、F8 资源占用观察 |
++| `f7.sh` | 和监测共用 SD 锁 `/tmp/mu1320-f8-sd.lock`：菜单动作等监测写完（最多 30 秒）再开始，SD 的读写状态不会在动作中途被改；多了开关 `off|on monitor` | 监测会临时把 SD 改成可写 |
++| `control.sh` purge | **重启保护**：本次开机里 F7 Java 运行过、监测还在跑、renderer 还在，或者有带 F7 标记的 DIO，就拒绝 purge，提示先重启 | F7 v2 车上在卸载的同一次开机里 purge（BACKLOG B14 附带建议） |
++| `control.sh` status | 新增 `F8_MONITOR:`、`F8_MONITOR_STATE:`（采样数、写 SD 次数、已写字节）、`OTHER_WORKSPACES:`（`/mnt/app/root` 里别的 mu1320 工作目录，例如 v1.1 遗留） | 遗留清理 |
++| `collect_f7.sh` | 采集时一并复制监测的日志和状态 | — |
+ 
+-命名：SD 文件夹 `mu1320-f7-daily-v2`，车上工作目录 `/mnt/app/root/mu1320-rgi-f7-v2`，BUILD_ID `MU1320-F7-DAILY-V2`，
+-JAR `CarPlayRGI-MU1320-F7DailyV2.jar`。`/tmp/mu1320-f7-*`、`/tmp/mu1320-f5-*`、`/tmp/mu1320-f6-touchpad-*` 与 v1.1 相同。
++命名：SD 文件夹 `mu1320-f7-daily-v2.1`；工作目录、BUILD_ID（`MU1320-F7-DAILY-V2`）、JAR 名、`/tmp` 开关都与 v2 相同。
+ 
+-## 绿色菜单（`Customization > MU1320 RGI`）
++## 监测写到哪里、写多少
+ 
+-| 按钮 | 调用 | 说明 |
+-| --- | --- | --- |
+-| 1 Status | `f7.sh status` | 只读，屏幕显示约 8 行摘要 |
+-| 2 Install | `f7.sh install` | 从原厂基线安装；**之后完整重启** |
+-| 3 Uninstall | `f7.sh rollback` | 卸载、恢复原厂文件，本次开机内停止 renderer 并关 BAP；**之后完整重启** |
+-| 4 Collect | `f7.sh collect snapshot` | 采集到 SD 的 `out/snapshot-<pid>/` |
+-| 5 EMERGENCY STOP | `f7.sh stop` | 立即：BAP 关、VC/HUD 回原厂、renderer 停、下一个 DIO 被动；**重启后恢复正常** |
+-
+-- 屏幕约 12 行，调度脚本只显示摘要（10 行以内），最后两行是 `Log: ...` 和 `RESULT: OK|FAILED`。完整输出在 SD 的
+-  `mu1320-f7-daily-v2/out/action-<命令>-<pid>.txt`（与 SSH 执行时相同）。
+-- 按下后要等 `RESULT:` 出现再离开页面（安装约 30–60 秒，stop 最多约 25 秒）。同一时间只能运行一个按钮；
+-  前一个没结束时再按会显示 `BUSY`。
+-- 屏幕上只有英文（GEM 字体没有中文）。
+-
+-## SSH 命令（与 v1.1 相同，另加菜单没有的）
+-
+-```sh
+-/bin/sh /fs/sda0/mu1320-f7-daily-v2/f7.sh status
+-echo "outer_shell_exit=$?"
+-```
+-
+-`f7.sh status|install|stop|rollback|purge|collect live|snapshot|restored|off|on native|render|bap|touchpad`，
+-打点 `f7_mark.sh <步骤号> [备注]`（追加到 `out/f7-marks.txt`）。运行时开关（`/tmp`，重启清空）：
+-`/tmp/mu1320-f5-bap-off`、`/tmp/mu1320-f5-render-off`、`/tmp/mu1320-f6-touchpad-off`、`/tmp/mu1320-f7-native-off`。
+-**注意**：`stop`/`rollback` 会写 `/tmp/mu1320-f5-bap-off`，所以 stop 之后 `on bap` 也不会恢复，要重启。
++- SD：`mu1320-f7-daily-v2.1/out/f8/boot-<序号>-<pid>/`，每次开机一个目录（序号记在 `out/f8/SEQ`，车上时钟不可靠，所以用序号排顺序）。
++  里面 `samples.txt`（采样记录，约 1 MB/小时）和 `logs/`（F7 日志的最新副本、`sloginfo.txt`）。
++- SD 原来是只读的话，监测每 2 分钟改成可写几秒、写完 `sync` 再改回只读；**不写 `/mnt/app`、`/mnt/system`**，只做只读查询（`pidin`、`sloginfo`、`ls`），不调用 `dmdt`。
++- 每次开机日志复制最多 256 MB，超过后只记采样。大于 1 MB 的日志每 10 分钟才复制一次。
++- 没插 SD 时只在内存里攒（最多 1 MB），插回后下一次补写。
++- 熄火断电前最后不到 2 分钟的记录可能没写上，这是预期的。
++- 监测在卸载（Uninstall）后 1 分钟内自己结束；`/tmp/mu1320-f8-mon-off` 让它本次开机结束；`f7.sh off monitor` 长期关掉。
+ 
+ ## 0. 前提
+ 
+-- 车上为原厂基线：F7 v1.1 已于 2026-09-27 回滚并重启（v1.1 工作目录 `mu1320-rgi-f7-v1.1` 还在，场次 R 用 v1.1 文件夹 `purge` 清掉）。
+-- 先按 `mu1320-toolbox-v1/MU1320-README.md` 更新 Toolbox，进 `Customization > MU1320 RGI` 能看到 5 个按钮，SSH 仍可连接。
+-- 把 `mu1320-f7-daily-v2/` 复制到 SD 根目录。SD 上不要同时放别的带 `TOOLBOX-ENTRY` 的 F7 文件夹（v1、v1.1 没有这个文件，放着没关系）。
+-  在 Mac 上复制后执行 `dot_clean`（去掉 `._*` 文件）。
++- 车上为原厂基线（F7 v2 已在 2026-10-02 卸载并 purge）。Toolbox v1 已装。
++- SD 根目录：**拿掉 `mu1320-f7-daily-v2/`**（它也带 `TOOLBOX-ENTRY`，两个同时在菜单会显示 `2 F7 FOLDERS`；在 Mac 上保留即可），
++  放入本文件夹 `mu1320-f7-daily-v2.1/`，并保留 `mu1320-f7-daily-v1.1/`（场次 L 用它清理 v1.1 遗留）。复制后在 Mac 上 `dot_clean`。
++- **F8 期间这张 SD 一直插在车上**。取卡只在熄火锁车、MMI 屏幕关掉以后；拷完马上插回。
+ 
+-## 1. 安装（菜单）
++## 场次 L：清理 v1.1 遗留工作目录（SSH，安装前）
+ 
+-1. 按 **1 Status**：应为 `SI: BASELINE/BASELINE`、`JAVA: ABSENT`、`NAVIGNORE: ACTIVE_BASELINE`，`RESULT: OK`。任何 `UNKNOWN` 都停止。
+-2. 按 **2 Install**：等到 `F7_install_FILES_PASSED` 和 `RESULT: OK`。
+-3. **正常完整重启**。重启后按 **1 Status**：`SI: F7_TRIAL/F7_TRIAL`、`JAVA: F7_INSTALLED`、`LISTENER: F7_READY`。
++1. 菜单 **1 Status**，完整输出在 SD 的 `out/action-status-*.txt`；看 `OTHER_WORKSPACES:` 一行（屏幕摘要里没有这一行，用 SSH 看更方便）：
+ 
+-## 2. 场次 Q：停车复测 B11/B12（约 20 分钟，建议带电脑做打点，也可以只用菜单）
++   ```sh
++   /bin/sh /fs/sda0/mu1320-f7-daily-v2.1/f7.sh status
++   ```
+ 
+-- **Q1** 连 USB CarPlay，Apple Maps 开始路线：地图框 + BAP 箭头出现（与 v1.1 相同）。
+-- **Q2 崩溃保护（B11，即 v1.1 的 P4）**：拔、插、10 秒内再拔、再插，连做 4 次。最后一次插上后开始路线：**应没有箭头**（第 4 代 DIO 被保护关掉）。
+-  按 **1 Status**：`GATE: strikes=3`。然后 SSH `rm /tmp/mu1320-f7-gate.strikes`（或者完整重启），正常插一次、开始路线：箭头恢复，`strikes=0`。
+-  （没带电脑时用重启代替 `rm`。）
+-- **Q3 应急停止（B12，即 v1.1 的 P7）**：路线进行中按 **5 EMERGENCY STOP**：屏幕出现 `JAVA_RELEASE: BAP_OFF`、`F7_STOPPED`、`RESULT: OK`；
+-  **VC 地图框和 HUD 箭头都在几秒内回原厂**（不用拔 USB）。
+-- **Q4** 紧接着按 **4 Collect**（重启前一定先采集，v1.1 的 P7 就是缺这一份日志）。
+-- **Q5** 拔插 USB、开始路线：没有箭头（stop 到重启为止）。**完整重启**，连 CarPlay、开始路线：一切恢复。
++2. 列出 `mu1320-rgi-f7-v1.1` 时，用 v1.1 自己的脚本清理（它会先和备份比对，不一致就拒绝）：
+ 
+-**判定**：Q1、Q2、Q3、Q5 通过即 Q 通过。
++   ```sh
++   /bin/sh /fs/sda0/mu1320-f7-daily-v1.1/f7.sh purge
++   ```
+ 
+-## 3. 场次 D：日常行驶（至少 2 次冷启动，不带电脑）
++3. 再看一次 status：`OTHER_WORKSPACES: none`（或只剩你确认要留的）。其他旧目录先不要动，把 status 发回来再决定。
+ 
+-- 正常用车，每次上车都是冷启动（锁车 → 开锁 → 点火）。连 CarPlay 后 Apple Maps / Google Maps 导航，至少一次到达目的地（Apple 到达最好，复核 B9）。
+-- **每次停车后、锁车前**按 **4 Collect**（`/tmp` 断电就清空，下次上车 MMI 已经重启过）。
+-- 在观察表记：箭头、地图框、HUD、车道、到达、触摸板、电话/Siri/音频/倒车影像是否正常，有无异常。
++## 场次 I：安装（菜单）
+ 
+-## 4. 场次 R：卸载、重装（菜单）+ 清理（SSH）
++1. **1 Status**：`SI: BASELINE/BASELINE`、`JAVA: ABSENT`、`NAVIGNORE: ACTIVE_BASELINE`。
++2. **2 Install**：等 `RESULT: OK`。**完整重启**。
++3. **1 Status**：`SI: F7_TRIAL/F7_TRIAL`、`JAVA: F7_INSTALLED`、`LISTENER: F7_READY`。
+ 
+-- **R1** USB 断开，按 **3 Uninstall**：`F7_ACTION_PASSED`/`RESULT: OK`。**完整重启**，按 **1 Status**：`SI: BASELINE/BASELINE`、`JAVA: ABSENT`、
+-  `NAVIGNORE: ACTIVE_BASELINE`。连 CarPlay：原厂行为（没有箭头），触摸板回原厂。按 **4 Collect**。
+-- **R2** 再按 **2 Install** → 完整重启 → 连 CarPlay 开始路线：一切恢复（重装会复用工作目录里已有且正确的文件）。
+-- **R3（可选，需要电脑）中断安装**：先按 **3 Uninstall** 并完整重启。SSH 执行 `f7.sh install`，看到 `install_STEP: write pending Java archive`
+-  时按 Ctrl-C：应输出 `INSTALL_INCOMPLETE`，挂载恢复为 ro。然后按菜单 **2 Install**：出现 `RESUME_WORKSPACE`，`RESULT: OK`，完整重启后正常。
+-  （另一种恢复：中断后按 **3 Uninstall**，也应回到原厂基线。）
+-- **R4 清理（SSH）**：最后决定留在哪个状态。要回原厂：按 **3 Uninstall** → 完整重启 → SSH
+-  `f7.sh purge`（删 v2 工作目录）；再用 v1.1 文件夹 `/bin/sh /fs/sda0/mu1320-f7-daily-v1.1/f7.sh purge` 删 v1.1 工作目录。
+-  purge 前会与备份比对，不一致就拒绝。
++## 场次 M：停车确认监测（约 10 分钟）
+ 
+-结果：把 SD 上 `mu1320-f7-daily-v2/out/` 整个目录、`OBSERVATIONS-F7.txt`（和有的话 SSH 终端输出、屏幕照片）复制到
+-工作站 `resource/private/vehicle-dump/f7-daily-v2/`。
++1. 连 USB CarPlay，开始一条 Apple Maps 路线：地图框、BAP 箭头、HUD 与 F7 v2 相同。
++2. 等 5 分钟以上，SSH `f7.sh status`：`F8_MONITOR: RUNNING pid=…`，`F8_MONITOR_STATE` 里 `flushes=` 至少 2，`mirror=1`。
++3. 按 **4 Collect**（这一次是为了对照监测记录）。
++4. 熄火锁车，等 MMI 关闭后取卡：SD 上应有 `out/f8/boot-1-*/samples.txt` 和 `logs/`。把整个 `out/` 拷到 Mac，卡插回。
++
++## 场次 N：日常使用（至少 10 次冷启动，跨几天）
++
++正常用车，不需要按任何按钮。尽量覆盖：
++
++- 冷启动（锁车 → 开锁 → 点火）≥10 次；每次都连 CarPlay，大部分时候用导航。
++- 短暂熄火不锁车再启动（MMI 休眠/唤醒）。
++- 导航中正常拔插 USB（间隔 10 秒以上）。快速插拔（1 秒内）不用做，那是 B14，F8 不测。
++- Apple Maps 与 Google Maps 互相切换；至少一次一小时以上的连续导航。
++- 电话、Siri、音乐、倒车影像、收音机照常使用。
++
++观察表 `OBSERVATIONS-F8.txt` 每天记一行（日期、冷启动次数、异常）。有异常时：能按就按 **4 Collect**，再照常处理（见下面“异常处理”）。
++每隔几天熄火后把 `out/` 拷回 Mac（SD 空间够的话也可以最后一次拷）。
++
++## 场次 X：最终卸载与重装（菜单）
++
++1. USB 断开，**3 Uninstall** → `RESULT: OK`；**完整重启**；**1 Status** 为原厂基线；连 CarPlay：原厂行为。
++2. **2 Install** → 完整重启 → 连 CarPlay 开始路线：一切恢复，`F8_MONITOR: RUNNING`。
++3. 之后保持安装状态继续日常使用（F8 通过后就是发行版本）。
++   如果要回原厂：**3 Uninstall** → **完整重启** → SSH `f7.sh purge`（v2.1 的 purge 现在会拒绝没重启就执行）。
++
++## 结果回传
++
++把 SD 上 `mu1320-f7-daily-v2.1/out/` 整个目录和填好的 `OBSERVATIONS-F8.txt`（有的话加 SSH 终端输出、照片）复制到工作站
++`resource/private/vehicle-dump/f8-v2.1/`。
+ 
+ ## 异常处理
+ 
+-- 箭头/地图框错乱、VC 黑块：按 **5 EMERGENCY STOP**；还不行就正常完整重启（重启会清掉 context 80）。
+-- CarPlay 焦点乱跑：SSH `f7.sh off touchpad`（菜单没有这个按钮；应急时 **5** 不会关触摸板，重启也不会，需要 `off touchpad` 或卸载）。
+-- HMI 黑屏、循环重启、CarPlay 反复重连、音频/倒车影像异常：不要再连 USB，按 **4 Collect**，再 **3 Uninstall** 并完整重启。
+-- 菜单显示 `NO F7 FOLDER` / `2 F7 FOLDERS`：检查 SD 根目录上带 `TOOLBOX-ENTRY` 的文件夹数量。
+-- 菜单不可用时 SSH 照常：`/bin/sh /fs/sda0/mu1320-f7-daily-v2/f7.sh rollback`；包装器不可用时 `control.sh rollback`。
+-- displaymanager 无响应（任何 `DMDT_TIMEOUT`）时停止。**不要运行 `dmdt ts`**。
++- 箭头/地图框错乱、VC 黑块：**5 EMERGENCY STOP**；还不行就正常完整重启。监测不受 stop 影响，继续记录这次开机。
++- 怀疑监测有影响（卡顿、SD 读写异常）：SSH `f7.sh off monitor`（长期关，下次开机生效；本次开机立即关：`touch /tmp/mu1320-f8-mon-off`）。
++- 菜单显示 `BUSY` 或 `SD busy for 30 s`：监测正在写 SD，过几秒再按。
++- HMI 黑屏、循环重启、CarPlay 反复重连、音频/倒车影像异常：不要再连 USB，**4 Collect**，**3 Uninstall** 并完整重启。
++- 菜单不可用时 SSH：`/bin/sh /fs/sda0/mu1320-f7-daily-v2.1/f7.sh rollback`。
++- **不要运行 `dmdt ts`**。
+ 
+ ## 已知限制 / 未在车上验证
+ 
+-- B11 的修复只在主机上验证（包括模拟“没有 rename 的文件系统”，v1.1 在同样条件下重现车上的失效）；场次 Q2 验证。
+-- B12 的修复用的是车上验证过的 BAP 运行时关闭开关（F3/F5、F7 v1.1 P5），但“先关 BAP、等 Java、再停 renderer”这个顺序只在主机上验证过；场次 Q3 验证。
+-  v1.1 P7 那次开机没有日志，原因是推断：VC 在原厂 KDK 位置画的是 BAP 箭头，看上去和地图框一样。
+-- 菜单调度脚本在主机上测试（sh 与 ksh），绿色菜单的执行环境来自 Toolbox v0 实车探测；v1 菜单本身第一次上车。
+-- 安装中断续装、purge 只在主机测试里验证过（场次 R3、R4 实车验证）。
+-- 无线 CarPlay 适配器不转发路线引导（B13），不显示箭头，与本包无关。
+-- BACKLOG B2、B4、B5、B6、B10 未改。
++- 监测只在主机上测试（sh 与 ksh、假 `pidin`/`mount`）。`pidin info`、`pidin times`、`pidin -p <pid> fds` 三种输出格式在本车上第一次用；
++  任何一个不可用时监测照常运行，只是那一项缺数据（场次 M 检查）。
++- 监测从第一次连 CarPlay 才开始，开机到连手机之间没有记录；完全不连手机的开机没有记录。
++- 无线 CarPlay 适配器不出箭头（B13）；快速插拔时原厂强杀 DIO（B14）未处理，F8 不测。
++- BACKLOG B2、B4、B5、B6 未改。

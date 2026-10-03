@@ -1,0 +1,142 @@
+#!/bin/sh
+# Stage 1 v2: standalone loading, baseline backup, isolated file rehearsal.
+set -eu
+PATH=/proc/boot:/bin:/usr/bin:/sbin:/usr/sbin:/mnt/app/armle/bin:/mnt/app/armle/usr/bin
+export PATH
+[ "$#" -le 1 ] || { echo 'STOP: usage: run_stage1.sh [prepare|restore]'; exit 2; }
+action=${1:-prepare}
+case "$action" in prepare|restore) ;; *) echo 'STOP: unknown action'; exit 2 ;; esac
+case "$0" in */*) stage_dir=${0%/*} ;; *) exit 2 ;; esac
+stage_dir=$(CDPATH= cd "$stage_dir" && pwd -P)
+ROOT=/mnt/app/root/mu1320-rgi-stage1-v2
+fail() { echo "STOP: $*" >&2; exit 1; }
+for utility in uname id cksum cp cmp ls mkdir chmod mv sync cat mount; do
+    command -v "$utility" >/dev/null 2>&1 || fail "missing $utility"
+done
+# QNX id -u can print leading spaces. Split whitespace, not names or extra tokens.
+uid_output=$(id -u) || fail 'id -u failed'
+set -f
+set -- $uid_output
+[ "$#" -eq 1 ] && [ "$1" = 0 ] || fail "expected numeric effective UID 0; id -u returned: [$uid_output]"
+case "$(uname -a)" in QNX\ *\ 6.5.0\ *\ armle) ;; *) fail 'expected QNX 6.5.0 armle' ;; esac
+[ -d /mnt/app/root ] && [ ! -L /mnt/app/root ] || fail 'unexpected root directory'
+if [ "$action" = prepare ]; then
+    [ ! -e "$ROOT" ] && [ ! -L "$ROOT" ] || fail 'workspace already exists; preserve backup, do not overwrite'
+else
+    [ -d "$ROOT" ] && [ ! -L "$ROOT" ] || fail 'no safe v2 workspace to restore'
+fi
+check_file() {
+    crc=$1; size=$2; file=$3
+    actual=$(cksum "$file") || return 1
+    set -f
+    set -- $actual
+    [ "${1:-}" = "$crc" ] && [ "${2:-}" = "$size" ] || fail "checksum $file"
+    echo "PASS: checksum $file"
+}
+meta() {
+    listing=$(LC_ALL=C ls -ln "$1") || return 1
+    set -f
+    set -- $listing
+    [ "$#" -ge 5 ] || return 1
+    printf '%s %s %s\n' "$1" "$3" "$4"
+}
+@CHECKS@
+# Run a helper with loader debug settings removed. Local child only.
+# Unset, not empty: ldqnx treats a set-but-empty LD_DEBUG_OUTPUT as a path and fails.
+# QNX sh (pdksh) may return 1 from unset of an unset variable; under set -e that is a silent exit.
+run_clean() {
+    (
+        for var in LD_PRELOAD LD_DEBUG DL_DEBUG LD_DEBUG_OUTPUT; do unset "$var" || :; done
+        LD_LIBRARY_PATH=/proc/boot:/lib exec "$@"
+    )
+}
+if [ "$action" = prepare ]; then
+echo 'Loading navigation-only hook in independent test process'
+loader_status=0
+run_clean "$stage_dir/loader_check" "$stage_dir/libcarplay_hook.so" || loader_status=$?
+echo "stage1_loader_exit=$loader_status"
+[ "$loader_status" -eq 0 ] || fail 'loader failed; no backup workspace created'
+fi
+mount_state() {
+    run_clean "$stage_dir/mount_state"
+}
+initial_mount=$(mount_state) || { st=$?; fail "cannot query initial /mnt/app mount state (exit $st)"; }
+case "$initial_mount" in ro|rw) ;; *) fail 'unrecognized mount state' ;; esac
+echo "MOUNT_INITIAL: /mnt/app $initial_mount"
+restore_ro=0
+completed=0
+cleanup() {
+    result=$?
+    trap - 0 1 2 15
+    set +e
+    if [ "$restore_ro" -eq 1 ]; then
+        sync || result=1
+        if ! mount -ur /mnt/app; then
+            echo 'STOP: could not restore /mnt/app read-only; run sync then mount -ur /mnt/app and preserve output' >&2
+            result=1
+        fi
+    fi
+    final_mount=$(mount_state)
+    query_result=$?
+    if [ "$query_result" -ne 0 ] || [ "$final_mount" != "$initial_mount" ]; then
+        echo "STOP: mount restoration unverified; initial=$initial_mount final=$final_mount" >&2
+        result=1
+    else
+        echo "MOUNT_RESTORED: /mnt/app $final_mount"
+    fi
+    if [ "$result" -eq 0 ] && [ "$completed" -eq 1 ]; then
+        echo "STAGE1_V2_PASSED: $action complete; original mount state verified"
+    fi
+    exit "$result"
+}
+trap cleanup 0
+trap 'exit 129' 1
+trap 'exit 130' 2
+trap 'exit 143' 15
+if [ "$initial_mount" = ro ]; then
+    # Arm cleanup BEFORE remount, including commands that fail after partial success.
+    restore_ro=1
+    mount -uw /mnt/app || fail 'could not remount /mnt/app read-write'
+fi
+[ "$(mount_state)" = rw ] || fail '/mnt/app is still read-only after remount'
+echo 'MOUNT_WORKING: /mnt/app rw'
+if [ "$action" = restore ]; then
+    /bin/sh "$stage_dir/transaction.sh" restore
+    /bin/sh "$stage_dir/transaction.sh" verify
+    sync
+    completed=1
+    exit 0
+fi
+umask 077
+mkdir "$ROOT"
+printf 'MU1320-STAGE1-V2-BACKUP-AND-REHEARSAL\n' > "$ROOT/IDENTITY"
+mkdir "$ROOT/backup"
+# Every backup source was validated above; only the new private directory is written.
+backup() {
+    source=$1; name=$2; wanted_crc=$3; wanted_size=$4
+    [ -f "$source" ] && [ ! -L "$source" ] || fail "source symlink/non-file $source"
+    [ ! -e "$ROOT/backup/$name" ] || fail 'backup collision'
+    before=$(meta "$source")
+    cp -p "$source" "$ROOT/backup/$name"
+    check_file "$wanted_crc" "$wanted_size" "$ROOT/backup/$name"
+    cmp "$source" "$ROOT/backup/$name" >/dev/null || fail 'source changed while copying'
+    [ "$before" = "$(meta "$ROOT/backup/$name")" ] || fail 'backup owner/group/mode mismatch'
+    [ "$before" = "$(meta "$source")" ] || fail 'source attributes changed while copying'
+    printf '%s %s %s %s\n' "$wanted_crc" "$wanted_size" "$name" "$source" >> "$ROOT/backup/index.txt"
+    LC_ALL=C ls -ldn "$source" "$ROOT/backup/$name" >> "$ROOT/backup/attributes.txt"
+}
+@BACKUPS@
+# Context only: inode output is not proof of cross-filesystem alias/write behavior.
+LC_ALL=C ls -ldin /etc /mnt/system/etc /etc/eso/production /mnt/system/etc/eso/production > "$ROOT/path-context.txt"
+printf 'BASELINE_BACKUP_COMPLETE\n' > "$ROOT/backup/COMPLETE"
+sync
+echo "BASELINE_BACKUP_COMPLETE: $ROOT/backup"
+/bin/sh "$stage_dir/transaction.sh" init
+/bin/sh "$stage_dir/transaction.sh" install
+/bin/sh "$stage_dir/transaction.sh" restore
+/bin/sh "$stage_dir/transaction.sh" verify
+# Recheck originals after all work; never repairs or rewrites them on mismatch.
+@ORIGINAL_CHECKS@
+sync
+completed=1
+echo 'Actual CarPlay interposition, Java, graphics and HMI-failure recovery remain untested.'

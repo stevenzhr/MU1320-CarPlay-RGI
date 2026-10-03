@@ -1,0 +1,211 @@
+#!/bin/sh
+set -eu
+for var in LD_PRELOAD LD_DEBUG DL_DEBUG LD_DEBUG_OUTPUT; do unset "$var" || :; done
+PATH=/proc/boot:/bin:/usr/bin:/sbin:/usr/sbin:/mnt/app/armle/bin:/mnt/app/armle/usr/bin
+export PATH
+[ "$#" -ge 1 ] || exit 2
+action=$1; phase=${2:-snapshot}
+case "$action:$#" in status:1|install:1|rollback:1|collect:2) ;; *) exit 2 ;; esac
+case "$phase" in f1|restored|snapshot) ;; *) exit 2 ;; esac
+case "$0" in */*) stage_dir=${0%/*} ;; *) exit 2 ;; esac
+stage_dir=$(CDPATH= cd "$stage_dir" && pwd -P)
+ROOT=@RUNTIME_ROOT@
+SYSTEM=/mnt/system/etc/eso/production/smartphone_integrator.json
+ACTIVE=/etc/eso/production/smartphone_integrator.json
+JARS=/mnt/app/eso/hmi/lsd/jars
+OLD=$JARS/NavActiveIgnore.jar
+NEW=$JARS/@F1_ARCHIVE@
+QUARANTINE=$ROOT/quarantine/NavActiveIgnore.jar
+BACKUP=$ROOT/backup/NavActiveIgnore.jar
+PAYLOAD=$ROOT/@PAYLOAD_NAME@
+fail() { echo "STOP: $*" >&2; exit 1; }
+exists() { [ -e "$1" ] || [ -L "$1" ]; }
+for utility in id uname cksum ls cat find; do command -v "$utility" >/dev/null 2>&1 || fail "missing $utility"; done
+uid=$(id -u); set -f; set -- $uid
+[ "$#" = 1 ] && [ "$1" = 0 ] || fail 'effective UID must be 0'
+case "$(uname -a)" in QNX\ *\ 6.5.0\ *\ armle) ;; *) fail 'wrong platform' ;; esac
+check() { [ -f "$3" ] && [ ! -L "$3" ] || return 1; c=$1; n=$2; output=$(cksum "$3") || return 1; set -- $output; [ "${1:-}" = "$c" ] && [ "${2:-}" = "$n" ]; }
+attrs() { output=$(LC_ALL=C ls -ln "$1") || return 1; set -- $output; [ "$#" -ge 5 ] || return 1; printf '%s %s %s\n' "$1" "$3" "$4"; }
+dir_attrs() { output=$(LC_ALL=C ls -ldn "$1") || return 1; set -- $output; [ "$#" -ge 5 ] || return 1; printf '%s %s %s\n' "$1" "$3" "$4"; }
+old_si_ok() { check @SI_OLD_CRC@ @SI_OLD_SIZE@ "$1" && [ "$(attrs "$1")" = '-rw-r--r-- 0 0' ]; }
+navignore_ok() { check @NAVIGNORE_CRC@ @NAVIGNORE_SIZE@ "$1" && [ "$(attrs "$1")" = '-rwxrwxrwx 0 0' ]; }
+java_ok() { check @JAVA_CRC@ @JAVA_SIZE@ "$1" && [ "$(attrs "$1")" = '-rw-r--r-- 0 0' ]; }
+run_clean() { (for var in LD_PRELOAD LD_DEBUG DL_DEBUG LD_DEBUG_OUTPUT; do unset "$var" || :; done; LD_LIBRARY_PATH=/proc/boot:/lib exec "$@"); }
+check @MOUNT_CRC@ @MOUNT_SIZE@ "$stage_dir/mount_state" || fail 'mount helper checksum'
+check @COLLECT_CRC@ @COLLECT_SIZE@ "$stage_dir/collect_f1.sh" || fail 'collector checksum'
+state() { run_clean "$stage_dir/mount_state" "$1"; }
+app_state=$(state /mnt/app) || fail 'app mount query'
+case "$app_state" in ro|rw) ;; *) fail 'unknown app mount state' ;; esac
+config_state() { if old_si_ok "$1"; then echo BASELINE; else echo UNKNOWN; fi; }
+navignore_state() {
+    if navignore_ok "$OLD"; then echo ACTIVE_BASELINE
+    elif exists "$OLD"; then echo UNKNOWN_PRESENT
+    elif navignore_ok "$QUARANTINE"; then echo QUARANTINED
+    else echo MISSING; fi
+}
+java_state() { if java_ok "$NEW"; then echo F1_INSTALLED; elif exists "$NEW"; then echo UNKNOWN_PRESENT; else echo ABSENT; fi; }
+files_state() {
+    case "$(navignore_state):$(java_state)" in
+        ACTIVE_BASELINE:ABSENT) echo INSTALLATION_BASELINE ;;
+        QUARANTINED:F1_INSTALLED) echo F1_INSTALLED ;;
+        ACTIVE_BASELINE:F1_INSTALLED) echo PARTIAL_F1_WITH_NAVIGNORE ;;
+        *) echo UNKNOWN ;;
+    esac
+}
+echo "SYSTEM_CONFIG: $(config_state "$SYSTEM")"; echo "ACTIVE_CONFIG: $(config_state "$ACTIVE")"
+echo "NAV_ACTIVE_IGNORE: $(navignore_state)"; echo "F1_ARCHIVE: $(java_state)"
+echo "FILES: $(files_state)"; echo "MOUNTS: app=$app_state"
+if [ "$action" = status ]; then echo 'FILE_STATE_ONLY: loaded classes change only after a normal full restart'; exit 0; fi
+if [ "$action" = collect ]; then exec /bin/sh "$stage_dir/collect_f1.sh" "$phase"; fi
+runtime_ok() {
+    [ -d "$ROOT" ] && [ ! -L "$ROOT" ] && [ -d "$ROOT/backup" ] && [ -d "$ROOT/quarantine" ] || fail 'unsafe runtime workspace'
+    for directory in "$ROOT" "$ROOT/backup" "$ROOT/quarantine"; do
+        [ "$(dir_attrs "$directory")" = 'drwx------ 0 0' ] || fail "runtime attributes $directory"
+    done
+    check @IDENTITY_CRC@ @IDENTITY_SIZE@ "$ROOT/IDENTITY" || fail 'identity mismatch'
+    java_ok "$PAYLOAD" || fail 'runtime Java payload checksum/attributes'
+    navignore_ok "$BACKUP" || fail 'NavActiveIgnore backup checksum/attributes'
+}
+# archive_scan MODE: the exact HMI archive set for baseline (NavActiveIgnore
+# active, no F1) or f1 (NavActiveIgnore absent, F1 present). Anything else stops.
+archive_scan() {
+    listing=$(find "$JARS" \( -name '*.jar' -o -name '*.zip' \)) || fail 'cannot enumerate HMI archives'
+    seen_old=0; seen_new=0
+    while IFS= read -r archive; do
+        case "$archive" in
+            "$OLD") [ "$1" = baseline ] || fail 'NavActiveIgnore still in scan tree'; navignore_ok "$archive" || fail 'NavActiveIgnore changed'; seen_old=1 ;;
+            "$NEW") [ "$1" = f1 ] || fail 'F1 archive present in baseline scan'; java_ok "$archive" || fail 'F1 archive changed'; seen_new=1 ;;
+@ARCHIVE_CASES@
+            *) fail "unknown HMI archive: $archive" ;;
+        esac
+    done <<ARCHIVE_LIST
+$listing
+ARCHIVE_LIST
+    if [ "$1" = baseline ]; then [ "$seen_old:$seen_new" = 1:0 ] || fail 'baseline archive set'; else [ "$seen_old:$seen_new" = 0:1 ] || fail 'F1 archive set'; fi
+}
+for utility in cp cmp mv chmod mkdir sync mount rm; do command -v "$utility" >/dev/null 2>&1 || fail "missing $utility"; done
+for directory in /mnt/app/root /mnt/app/eso/hmi/lsd "$JARS"; do [ -d "$directory" ] && [ ! -L "$directory" ] || fail "unsafe directory $directory"; done
+files=$(files_state)
+if [ "$action" = install ]; then
+    old_si_ok "$SYSTEM" && old_si_ok "$ACTIVE" || fail 'baseline SI required at both paths (no native trial may be installed)'
+    check @DIO_OLD_CRC@ @DIO_OLD_SIZE@ /etc/eso/production/dio_manager.json || fail 'active dio config differs'
+    check @DIO_OLD_CRC@ @DIO_OLD_SIZE@ /mnt/system/etc/eso/production/dio_manager.json || fail 'system dio config differs'
+    for token in /tmp/mu1320-navhook-v1.arm /tmp/carplay_verbose; do if exists "$token"; then fail "trial marker present: $token"; fi; done
+    @PAYLOAD_CHECKS@
+    case "$files" in
+        INSTALLATION_BASELINE) archive_scan baseline ;;
+        PARTIAL_F1_WITH_NAVIGNORE) echo 'RESUME_INSTALL: F1 archive exact, NavActiveIgnore not yet quarantined' ;;
+        F1_INSTALLED) runtime_ok; archive_scan f1; echo 'INSTALL_ALREADY_COMPLETE: no writes; a normal full restart loads F1'; exit 0 ;;
+        *) fail "install needs INSTALLATION_BASELINE, found $files" ;;
+    esac
+    if exists "$ROOT"; then
+        [ -d "$ROOT" ] && [ ! -L "$ROOT" ] || fail 'runtime workspace is not a directory; preserve it'
+        [ "$(dir_attrs "$ROOT")" = 'drwx------ 0 0' ] || fail 'runtime root attributes; preserve it'
+        echo 'RESUME_WORKSPACE: existing runtime files are re-verified; mismatches are replaced'
+    fi
+else
+    case "$files" in
+        INSTALLATION_BASELINE) archive_scan baseline; echo 'ROLLBACK_ALREADY_BASELINE: a normal full restart is still required if F1 classes were loaded'; exit 0 ;;
+        F1_INSTALLED|PARTIAL_F1_WITH_NAVIGNORE) runtime_ok ;;
+        *)
+            # NavActiveIgnore missing from both places is recoverable from the verified backup.
+            [ "$(navignore_state)" = MISSING ] || fail "unknown file state $files; preserve it"
+            case "$(java_state)" in F1_INSTALLED|ABSENT) runtime_ok ;; *) fail 'unknown F1 archive; preserve it' ;; esac ;;
+    esac
+fi
+restore_app=0; completed=0
+cleanup() {
+    rc=$?; trap - 0 1 2 15; set +e; sync || rc=1
+    if [ "$restore_app" = 1 ]; then mount -ur /mnt/app || rc=1; fi
+    final_app=$(state /mnt/app); aq=$?
+    if [ "$aq" != 0 ] || [ "$final_app" != "$app_state" ]; then echo 'STOP: original app mount not restored' >&2; rc=1; else echo "MOUNTS_RESTORED: app=$final_app"; fi
+    if [ "$rc" = 0 ] && [ "$completed" = 1 ]; then echo "F1_${action}_FILES_PASSED: no restart performed"
+    elif [ "$action" = install ]; then echo 'INSTALL_INCOMPLETE: rerun install to resume, or rollback before restart' >&2; fi
+    exit "$rc"
+}
+trap cleanup 0; trap 'exit 129' 1; trap 'exit 130' 2; trap 'exit 143' 15
+if [ "$app_state" = ro ]; then restore_app=1; mount -uw /mnt/app || fail 'app remount rw'; fi
+[ "$(state /mnt/app)" = rw ] || fail 'app not writable'
+phase_write() {
+    tmp="$ROOT/phase.pending.$$"; if exists "$tmp"; then fail 'phase collision'; fi
+    printf '%s\n' "$1" > "$tmp" || fail "phase write $1"; mv "$tmp" "$ROOT/phase.txt" || fail "phase commit $1"; sync || fail "phase sync $1"
+}
+witness() {
+    target="/tmp/mu1320-f1-@VERSION@.$1-witness"
+    if exists "$target"; then [ -f "$target" ] && [ ! -L "$target" ] || fail "unsafe $1 witness"; fi
+    printf 'MU1320-F1-V1 %s pid=%s\n' "$1" "$$" > "$target" || fail "$1 witness write"
+}
+# put_file SRC DST MODE CKSUM SIZE LABEL keep|plain: exact DST is kept, otherwise
+# pending copy, verify, rename.
+put_file() {
+    if check "$4" "$5" "$2"; then chmod "$3" "$2" || fail "$6 chmod"; echo "install_STEP: $6 already exact"; return 0; fi
+    part="$2.pending.$$"; if exists "$part"; then fail "$6 pending collision"; fi
+    echo "install_STEP: write $6"
+    if [ "$7" = keep ]; then cp -p "$1" "$part" || fail "$6 copy"; else cp "$1" "$part" || fail "$6 copy"; fi
+    chmod "$3" "$part" || fail "$6 chmod"; check "$4" "$5" "$part" || fail "$6 validation"
+    mv "$part" "$2" || fail "$6 commit rename"
+}
+if [ "$action" = install ]; then
+    echo 'install_STEP: prepare private runtime workspace'
+    umask 077
+    for directory in "$ROOT" "$ROOT/backup" "$ROOT/quarantine"; do
+        if exists "$directory"; then [ -d "$directory" ] && [ ! -L "$directory" ] || fail "unsafe runtime directory $directory"
+        else mkdir "$directory" || fail "runtime mkdir $directory"; fi
+    done
+    if exists "$QUARANTINE"; then fail 'quarantine slot occupied while NavActiveIgnore is active; preserve both'; fi
+    put_file "$stage_dir/IDENTITY" "$ROOT/IDENTITY" 600 @IDENTITY_CRC@ @IDENTITY_SIZE@ 'identity' plain
+    put_file "$OLD" "$BACKUP" 777 @NAVIGNORE_CRC@ @NAVIGNORE_SIZE@ 'NavActiveIgnore backup' keep
+    put_file "$stage_dir/@PAYLOAD_NAME@.DISABLED" "$PAYLOAD" 644 @JAVA_CRC@ @JAVA_SIZE@ 'runtime Java payload' plain
+    sync || fail 'sync private runtime workspace'
+    runtime_ok; cmp "$OLD" "$BACKUP" >/dev/null || fail 'NavActiveIgnore changed during backup'
+    phase_write BACKUP_VERIFIED
+    witness install
+    if ! java_ok "$NEW"; then
+        pending="$JARS/.mu1320-f1.pending.$$"
+        if exists "$pending"; then fail 'Java pending collision'; fi
+        echo 'install_STEP: write pending F1 archive'
+        cp "$PAYLOAD" "$pending" || { rm -f "$pending" || :; fail 'Java pending copy'; }
+        chmod 644 "$pending" || { rm -f "$pending" || :; fail 'Java pending chmod'; }
+        java_ok "$pending" || { rm -f "$pending" || :; fail 'Java pending validation'; }
+        sync || { rm -f "$pending" || :; fail 'sync before Java commit'; }
+        echo 'install_STEP: commit F1 archive rename'
+        mv "$pending" "$NEW" || { rm -f "$pending" || :; fail 'Java commit rename'; }
+    fi
+    java_ok "$NEW" || fail 'F1 install validation'
+    phase_write F1_ARCHIVE_INSTALLED
+    # Same qnx6 filesystem: rename moves NavActiveIgnore out of the recursive scan tree atomically.
+    echo 'install_STEP: move NavActiveIgnore out of the scan tree'
+    mv "$OLD" "$QUARANTINE" || fail 'NavActiveIgnore quarantine rename'
+    navignore_ok "$QUARANTINE" || fail 'quarantined NavActiveIgnore validation'
+    cmp "$QUARANTINE" "$BACKUP" >/dev/null || fail 'quarantine differs from backup'
+    archive_scan f1
+    phase_write F1_INSTALLED
+else
+    witness rollback
+    if ! navignore_ok "$OLD"; then
+        if navignore_ok "$QUARANTINE"; then
+            echo 'rollback_STEP: move quarantined NavActiveIgnore back'
+            mv "$QUARANTINE" "$OLD" || fail 'NavActiveIgnore restore rename'
+        else
+            pending="$JARS/.mu1320-f1-restore.pending.$$"
+            if exists "$pending"; then fail 'restore pending collision'; fi
+            echo 'rollback_STEP: restore NavActiveIgnore from verified backup'
+            cp -p "$BACKUP" "$pending" || { rm -f "$pending" || :; fail 'NavActiveIgnore restore copy'; }
+            chmod 777 "$pending" || { rm -f "$pending" || :; fail 'NavActiveIgnore restore chmod'; }
+            navignore_ok "$pending" || { rm -f "$pending" || :; fail 'NavActiveIgnore restore validation'; }
+            mv "$pending" "$OLD" || { rm -f "$pending" || :; fail 'NavActiveIgnore restore commit'; }
+        fi
+    fi
+    navignore_ok "$OLD" || fail 'restored NavActiveIgnore validation'
+    phase_write NAVIGNORE_RESTORED
+    if exists "$NEW"; then
+        removed="$ROOT/removed-java.$$"; if exists "$removed"; then fail 'Java removal collision'; fi
+        echo 'rollback_STEP: move F1 archive out of the scan tree'
+        mv "$NEW" "$removed" || fail 'Java removal rename'; java_ok "$removed" || fail 'removed Java validation'
+    fi
+    ! exists "$NEW" || fail 'F1 archive still active'
+    cmp "$OLD" "$BACKUP" >/dev/null || fail 'NavActiveIgnore differs from trial backup'
+    archive_scan baseline
+    phase_write INSTALLATION_BASELINE_RESTORED
+fi
+sync || fail 'final sync'; completed=1

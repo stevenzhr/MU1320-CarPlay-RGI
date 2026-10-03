@@ -1,0 +1,131 @@
+#!/bin/sh
+# MU1320 env-only controlled trial. No hook, wrapper, DIO replacement or Java.
+set -eu
+for var in LD_PRELOAD LD_DEBUG DL_DEBUG LD_DEBUG_OUTPUT; do unset "$var" || :; done
+PATH=/proc/boot:/bin:/usr/bin:/sbin:/usr/sbin:/mnt/app/armle/bin:/mnt/app/armle/usr/bin
+export PATH
+[ "$#" -ge 1 ] || { echo 'usage: env_probe.sh status|install|rollback|collect [before|marked|restored]'; exit 2; }
+action=$1; phase=${2:-snapshot}
+case "$action:$#" in status:1|install:1|rollback:1|collect:1|collect:2) ;; *) exit 2 ;; esac
+case "$phase" in before|marked|restored|snapshot) ;; *) exit 2 ;; esac
+case "$0" in */*) stage_dir=${0%/*} ;; *) exit 2 ;; esac
+stage_dir=$(CDPATH= cd "$stage_dir" && pwd -P)
+ROOT=/mnt/app/root/mu1320-env-probe-@VERSION@
+SYSTEM=/mnt/system/etc/eso/production/smartphone_integrator.json
+ACTIVE=/etc/eso/production/smartphone_integrator.json
+MARKER=@MARKER@
+fail() { echo "STOP: $*" >&2; exit 1; }
+exists() { [ -e "$1" ] || [ -L "$1" ]; }
+for utility in id uname cksum ls cat; do command -v "$utility" >/dev/null 2>&1 || fail "missing $utility"; done
+uid=$(id -u) || fail 'id failed'
+set -f; set -- $uid
+[ "$#" -eq 1 ] && [ "$1" = 0 ] || fail 'effective UID must be 0'
+case "$(uname -a)" in QNX\ *\ 6.5.0\ *\ armle) ;; *) fail 'wrong platform' ;; esac
+check() {
+    [ -f "$3" ] && [ ! -L "$3" ] || return 1
+    expected_crc=$1; expected_size=$2; output=$(cksum "$3") || return 1
+    set -- $output
+    [ "${1:-}" = "$expected_crc" ] && [ "${2:-}" = "$expected_size" ]
+}
+attrs() { output=$(LC_ALL=C ls -ln "$1") || return 1; set -- $output; [ "$#" -ge 5 ] || return 1; printf '%s %s %s\n' "$1" "$3" "$4"; }
+old_ok() { check @OLD_CRC@ @OLD_SIZE@ "$1" && [ "$(attrs "$1")" = '-rw-r--r-- 0 0' ]; }
+new_ok() { check @NEW_CRC@ @NEW_SIZE@ "$1" && [ "$(attrs "$1")" = '-rw-r--r-- 0 0' ]; }
+config_state() { if old_ok "$1"; then echo BASELINE; elif new_ok "$1"; then echo ENV_PROBE; else echo UNKNOWN; fi; }
+run_clean() { (for var in LD_PRELOAD LD_DEBUG DL_DEBUG LD_DEBUG_OUTPUT; do unset "$var" || :; done; LD_LIBRARY_PATH=/proc/boot:/lib exec "$@"); }
+check @MOUNT_CRC@ @MOUNT_SIZE@ "$stage_dir/mount_state" || fail 'mount helper checksum'
+check 3727885851 560715 /proc/boot/libc.so.3 || fail 'libc baseline'
+check @COLLECT_CRC@ @COLLECT_SIZE@ "$stage_dir/collect_env.sh" || fail 'collector checksum'
+state() { run_clean "$stage_dir/mount_state" "$1"; }
+app_state=$(state /mnt/app) || fail 'app mount query'
+system_state=$(state /mnt/system) || fail 'system mount query'
+case "$app_state:$system_state" in ro:ro|ro:rw|rw:ro|rw:rw) ;; *) fail 'unknown mount states' ;; esac
+echo "SYSTEM_CONFIG: $(config_state "$SYSTEM")"
+echo "ACTIVE_CONFIG: $(config_state "$ACTIVE")"
+echo "MOUNTS: app=$app_state system=$system_state"
+echo "EXPECTED_MARKER: MU1320_SI_PROBE=$MARKER"
+if [ "$action" = status ]; then echo 'FILE_STATE_ONLY: this does not establish live SI configuration'; exit 0; fi
+if [ "$action" = collect ]; then
+    exec /bin/sh "$stage_dir/collect_env.sh" "$phase"
+fi
+for utility in cp mv chmod mkdir sync mount; do command -v "$utility" >/dev/null 2>&1 || fail "missing $utility"; done
+for directory in /mnt/app/root /mnt/system/etc /mnt/system/etc/eso /mnt/system/etc/eso/production; do
+    [ -d "$directory" ] && [ ! -L "$directory" ] || fail "unsafe directory $directory"
+done
+if [ "$action" = install ]; then
+    exists "$ROOT" && fail 'workspace exists; preserve it; do not repeat install'
+    old_ok "$SYSTEM" && old_ok "$ACTIVE" || fail 'baseline SI required at both paths'
+    [ -z "${MU1320_SI_PROBE:-}" ] || fail 'probe variable already in SSH environment; do not export it'
+    exists /tmp/mu1320-stage3.arm && fail 'old Stage3 arm token exists; finish old rollback first'
+    check 2960431692 2645 /mnt/app/eso/hmi/lsd/jars/NavActiveIgnore.jar || fail 'Stage2 must be rolled back'
+    exists /mnt/app/eso/hmi/lsd/jars/CarPlayRGI-MU1320-Stage2.jar && fail 'Stage2 still installed'
+    check 3919119664 15734 /etc/eso/production/dio_manager.json || fail 'active dio config differs'
+    check 3919119664 15734 /mnt/system/etc/eso/production/dio_manager.json || fail 'system dio config differs'
+    @NATIVE_CHECKS@
+    check @NEW_CRC@ @NEW_SIZE@ "$stage_dir/smartphone_integrator.json" || fail 'candidate checksum'
+    check @IDENTITY_CRC@ @IDENTITY_SIZE@ "$stage_dir/IDENTITY" || fail 'identity payload'
+else
+    if old_ok "$SYSTEM"; then echo 'ROLLBACK_ALREADY_BASELINE: live SI/DIO may still require a normal full restart'; exit 0; fi
+    new_ok "$SYSTEM" || fail 'system config is not this trial; preserve it'
+    [ -d "$ROOT/backup" ] && [ ! -L "$ROOT" ] && [ ! -L "$ROOT/backup" ] || fail 'unsafe backup directory'
+    check @IDENTITY_CRC@ @IDENTITY_SIZE@ "$ROOT/IDENTITY" || fail 'identity mismatch'
+    old_ok "$ROOT/backup/smartphone_integrator.json" || fail 'rollback backup changed'
+fi
+witness="/tmp/mu1320-env-probe-@VERSION@-$action-witness"
+witness_preexists=0
+if exists "$witness"; then
+    [ -f "$witness" ] && [ ! -L "$witness" ] && [ "$(attrs "$witness")" = '-rw------- 0 0' ] && [ "$(cat "$witness")" = "$MARKER" ] || fail 'unknown boot witness; preserve it'
+    witness_preexists=1
+fi
+restore_app=0; restore_system=0; completed=0
+cleanup() {
+    result=$?; trap - 0 1 2 15; set +e
+    sync || result=1
+    if [ "$restore_system" = 1 ]; then mount -ur /mnt/system || result=1; fi
+    if [ "$restore_app" = 1 ]; then mount -ur /mnt/app || result=1; fi
+    final_app=$(state /mnt/app); app_query=$?
+    final_system=$(state /mnt/system); system_query=$?
+    if [ "$app_query" != 0 ] || [ "$system_query" != 0 ] || [ "$final_app:$final_system" != "$app_state:$system_state" ]; then
+        echo 'STOP: original mounts not restored; preserve output and check mounts' >&2; result=1
+    else echo "MOUNTS_RESTORED: app=$final_app system=$final_system"; fi
+    if [ "$result" = 0 ] && [ "$completed" = 1 ]; then echo "ENV_PROBE_${action}_FILES_PASSED: no restart performed";
+    elif [ "$action" = install ]; then echo 'INSTALL_INCOMPLETE: run rollback before any planned restart' >&2; fi
+    exit "$result"
+}
+trap cleanup 0
+trap 'exit 129' 1
+trap 'exit 130' 2
+trap 'exit 143' 15
+if [ "$action" = install ]; then
+    if [ "$app_state" = ro ]; then restore_app=1; mount -uw /mnt/app; fi
+    [ "$(state /mnt/app)" = rw ] || fail 'app not writable'
+    umask 077
+    mkdir "$ROOT" "$ROOT/backup"
+    cp "$stage_dir/IDENTITY" "$ROOT/IDENTITY"
+    cp -p "$SYSTEM" "$ROOT/backup/smartphone_integrator.json"
+    check @IDENTITY_CRC@ @IDENTITY_SIZE@ "$ROOT/IDENTITY" || fail 'identity copy'
+    old_ok "$ROOT/backup/smartphone_integrator.json" || fail 'backup validation'
+    sync
+    source="$stage_dir/smartphone_integrator.json"
+else
+    source="$ROOT/backup/smartphone_integrator.json"
+fi
+# A surviving RAM witness makes an HMI-only restart apparent. Its absence alone
+# is not proof of a full boot; correlate SI start times and the user's reboot.
+umask 077
+if [ "$witness_preexists" = 0 ]; then
+    (set -C; printf '%s\n' "$MARKER" > "$witness") || fail 'boot witness creation'
+fi
+if [ "$system_state" = ro ]; then restore_system=1; mount -uw /mnt/system; fi
+[ "$(state /mnt/system)" = rw ] || fail 'system not writable'
+pending="/mnt/system/etc/eso/production/.mu1320-env-probe-$action.$$"
+exists "$pending" && fail 'system temporary collision'
+if [ "$action" = rollback ]; then cp -p "$source" "$pending"; else cp "$source" "$pending"; fi
+chmod 644 "$pending"
+if [ "$action" = install ]; then new_ok "$pending" || fail 'pending candidate validation';
+else old_ok "$pending" || fail 'pending restore validation'; fi
+sync
+mv "$pending" "$SYSTEM"
+if [ "$action" = install ]; then new_ok "$SYSTEM" || fail 'installed candidate validation';
+else old_ok "$SYSTEM" || fail 'restored SI validation'; fi
+sync
+completed=1
